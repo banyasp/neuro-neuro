@@ -21,8 +21,8 @@ Your module must provide:
 | Name | What |
 |---|---|
 | `CONFIG` | `{**COMMON_CONFIG, ...your constants}`. Don't override anything from `COMMON_CONFIG` |
-| `weight_shapes(cfg=CONFIG)` | `{name: shape}` for every int8 weight array. Each becomes `weights_<name>.txt` |
-| `run_int_reference(spikes, weights, cfg=CONFIG)` | Integer-only (NumPy ints, no floats). `spikes` is `[T, n_inputs]` 0/1, `weights` is `{name: int8 array}`. Returns a dict: every per-timestep trace as a 2D `[T, n]` array (each written to `expected_<key>.txt`), plus `"out"` (`[T, n_out]` output spikes), `"counts"` (spike count per output neuron) and `"decision"` (0/1) |
+| `weight_shapes(cfg=CONFIG)` | `{name: shape}` for every 2D int8 weight array. Each becomes `weights_<name>.mem` |
+| `run_int_reference(spikes, weights, cfg=CONFIG)` | Integer-only (NumPy ints, no floats). `spikes` is `[T, n_inputs]` 0/1, `weights` is `{name: int8 array}`. Returns a dict: every per-timestep trace as a 2D `[T, n]` array (each written to `expected_<key>.mem`; keys starting with `spk` are written as packed bits, everything else as int16), plus `"out"` (`[T, n_out]` output spikes), `"counts"` (spike count per output neuron) and `"decision"` (0/1) |
 | `REFERENCE_FUNCS` | List of functions copied into the standalone `reference_<name>.py`. Must include `weight_shapes`, `run_int_reference` and every helper they call. They may use `np`, `CONFIG`, `W_MIN/W_MAX/V_MIN/V_MAX` and nothing else |
 | `test_cases(rng, cfg=CONFIG)` | List of `(folder, description, weights, spikes)`. Folder `"."` is the top of `handoff/<name>/`. Include at least one case that exercises saturation |
 | `spec_md(cfg=CONFIG)` | Markdown for your model's section of `spec.md`: constants, exact math rules, weight file layouts, trace meanings |

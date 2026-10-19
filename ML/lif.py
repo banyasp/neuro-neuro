@@ -37,7 +37,7 @@ CONFIG = {
 
 
 def weight_shapes(cfg=CONFIG):
-    """Name -> shape of every int8 weight array. Files are weights_<name>.txt."""
+    """Name -> shape of every int8 weight array. Files are weights_<name>.mem."""
     return {"l1": (cfg["n_inputs"], cfg["n_hidden"]),
             "l2": (cfg["n_hidden"], cfg["n_outputs"])}
 
@@ -76,7 +76,8 @@ def run_int_reference(spikes, weights, cfg=CONFIG):
     weights: {"l1": int8 [n_inputs, n_hidden], "l2": int8 [n_hidden, n_outputs]}
 
     Returns a dict of per-timestep traces [T, n] (membranes are after reset),
-    each written to expected_<key>.txt, plus "out" output spikes, "counts", "decision".
+    each written to expected_<key>.mem, plus "out" output spikes, "counts", "decision".
+    Keys starting with "spk" are written as packed bits; all others as int16.
     """
     spikes = np.asarray(spikes)
     T = spikes.shape[0]
@@ -181,11 +182,11 @@ Notes:
 
 | File | Contents |
 |---|---|
-| `weights_l1.txt` | W1 `[{ni}][{nh}]`, {ni * nh} lines: line `i*{nh} + j` = `W1[i][j]` |
-| `weights_l2.txt` | W2 `[{nh}][{no}]`, {nh * no} lines: line `i*{no} + j` = `W2[i][j]` |
-| `expected_mem_l1.txt` | T rows, {nh} ints: layer-1 membrane **after reset** |
-| `expected_spk_l1.txt` | T rows, {nh} 0/1: layer-1 spikes |
-| `expected_mem_l2.txt` | T rows, {no} ints: layer-2 membrane **after reset** |
+| `weights_l1.mem` | W1 `[{ni}][{nh}]`, {ni * nh} words: address `i*{nh} + j` = `W1[i][j]` (grouped by input, suits event-driven fetch) |
+| `weights_l2.mem` | W2 `[{nh}][{no}]`, {nh * no} words: address `i*{no} + j` = `W2[i][j]` |
+| `expected_mem_l1.mem` | T*{nh} words, int16: address `t*{nh} + j` = layer-1 membrane of neuron `j` at step `t`, **after reset** |
+| `expected_spk_l1.mem` | T words of {nh} bits: bit `j` = layer-1 neuron `j` spiked at step `t` |
+| `expected_mem_l2.mem` | T*{no} words, int16: address `t*{no} + j`, **after reset** |
 """
 
 

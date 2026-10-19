@@ -52,20 +52,31 @@ Notes:
 
 | File | Contents |
 |---|---|
-| `weights_l1.txt` | W1 `[46][64]`, 2944 lines: line `i*64 + j` = `W1[i][j]` |
-| `weights_l2.txt` | W2 `[64][2]`, 128 lines: line `i*2 + j` = `W2[i][j]` |
-| `expected_mem_l1.txt` | T rows, 64 ints: layer-1 membrane **after reset** |
-| `expected_spk_l1.txt` | T rows, 64 0/1: layer-1 spikes |
-| `expected_mem_l2.txt` | T rows, 2 ints: layer-2 membrane **after reset** |
+| `weights_l1.mem` | W1 `[46][64]`, 2944 words: address `i*64 + j` = `W1[i][j]` (grouped by input, suits event-driven fetch) |
+| `weights_l2.mem` | W2 `[64][2]`, 128 words: address `i*2 + j` = `W2[i][j]` |
+| `expected_mem_l1.mem` | T*64 words, int16: address `t*64 + j` = layer-1 membrane of neuron `j` at step `t`, **after reset** |
+| `expected_spk_l1.mem` | T words of 64 bits: bit `j` = layer-1 neuron `j` spiked at step `t` |
+| `expected_mem_l2.mem` | T*2 words, int16: address `t*2 + j`, **after reset** |
 
-## Files in every case folder (plain decimal text)
+## File format (`.mem`, for `$readmemh`)
+
+- Hex, no `0x` prefix. First line of every file is a `//` comment describing it.
+- **Signed values** (weights, membranes): two's complement, fixed width. int8 = 2 hex digits
+  (`-1` = `ff`), int16 = 4 hex digits (`-1` = `ffff`). Sign-extend when you load them.
+- **Spike rasters** (`input_spikes`, `expected_spk_*`, `expected_out`): one word per timestep
+  (address = `t`), all lines packed into the word, **bit `i` = line/neuron `i`** (LSB = 0).
+  E.g. `reg [N_IN-1:0] spikes [0:T-1]; $readmemh("input_spikes.mem", spikes);`
+- **Multi-value traces** (`expected_mem_*`): one value per word, address = `t*N + j`.
 
 | File | Contents |
 |---|---|
-| `weights_<name>.txt` | int8, one per line, row-major (layouts above) |
-| `input_spikes.txt` | T rows, N_IN space-separated 0/1 |
-| `expected_<trace>.txt` | T rows, one per timestep (traces above) |
-| `expected_out.txt` | T rows of output spikes; final line: spike count per output neuron, then decision |
+| `weights_<name>.mem` | int8, one per word, row-major (layouts above) |
+| `input_spikes.mem` | T words of N_IN bits |
+| `expected_spk_<layer>.mem` | T words, one bit per neuron |
+| `expected_mem_<layer>.mem` | T*N words, int16 |
+| `expected_out.mem` | T words, one bit per output neuron |
+| `expected_counts.mem` | one unsigned 16-bit word per output neuron: spikes over the window |
+| `expected_decision.mem` | one word: 1 = seizure, 0 = no seizure |
 
 `reference_lif.py` (top folder only) is the standalone integer reference (NumPy only).
 `python reference_lif.py` re-checks every case.

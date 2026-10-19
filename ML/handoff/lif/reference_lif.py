@@ -26,7 +26,7 @@ V_MAX = 2 ** (CONFIG["mem_bits"] - 1) - 1
 
 
 def weight_shapes(cfg=CONFIG):
-    """Name -> shape of every int8 weight array. Files are weights_<name>.txt."""
+    """Name -> shape of every int8 weight array. Files are weights_<name>.mem."""
     return {"l1": (cfg["n_inputs"], cfg["n_hidden"]),
             "l2": (cfg["n_hidden"], cfg["n_outputs"])}
 
@@ -61,7 +61,8 @@ def run_int_reference(spikes, weights, cfg=CONFIG):
     weights: {"l1": int8 [n_inputs, n_hidden], "l2": int8 [n_hidden, n_outputs]}
 
     Returns a dict of per-timestep traces [T, n] (membranes are after reset),
-    each written to expected_<key>.txt, plus "out" output spikes, "counts", "decision".
+    each written to expected_<key>.mem, plus "out" output spikes, "counts", "decision".
+    Keys starting with "spk" are written as packed bits; all others as int16.
     """
     spikes = np.asarray(spikes)
     T = spikes.shape[0]
@@ -93,19 +94,39 @@ def run_int_reference(spikes, weights, cfg=CONFIG):
 
 
 # ---------------------------------------------------------------------------
-# Re-check the handoff files: python reference_<name>.py
+# Re-check the handoff .mem files: python reference_<name>.py
 # ---------------------------------------------------------------------------
 
 NOT_TRACES = ("out", "counts", "decision")
+COUNT_BITS = 16
+
+
+def read_mem(path):
+    """Hex words from a $readmemh file, skipping // comments and blank lines."""
+    words = []
+    for line in Path(path).read_text().splitlines():
+        line = line.split("//")[0].strip()
+        if line:
+            words.append(int(line, 16))
+    return words
+
+
+def to_signed(words, bits):
+    return np.array([w - (1 << bits) if w >> (bits - 1) else w for w in words], dtype=np.int64)
+
+
+def unpack_bits(words, n):
+    """Packed words -> [len(words), n] 0/1 array, bit i = column i."""
+    return np.array([[(w >> i) & 1 for i in range(n)] for w in words], dtype=np.int64)
 
 
 def load_case(folder):
     folder = Path(folder)
     weights = {}
     for name, shape in weight_shapes().items():
-        w = np.loadtxt(folder / f"weights_{name}.txt", dtype=np.int64)
+        w = to_signed(read_mem(folder / f"weights_{name}.mem"), CONFIG["weight_bits"])
         weights[name] = w.reshape(shape).astype(np.int8)
-    spikes = np.loadtxt(folder / "input_spikes.txt", dtype=np.int64, ndmin=2)
+    spikes = unpack_bits(read_mem(folder / "input_spikes.mem"), CONFIG["n_inputs"])
     return weights, spikes
 
 
@@ -113,26 +134,30 @@ def check_case(folder):
     folder = Path(folder)
     weights, spikes = load_case(folder)
     r = run_int_reference(spikes, weights)
-    ok = True
+    expected = {}
     for key, trace in r.items():
         if key in NOT_TRACES:
             continue
-        expected = np.loadtxt(folder / f"expected_{key}.txt", dtype=np.int64, ndmin=2)
-        if not np.array_equal(expected, trace):
-            print(f"  MISMATCH in expected_{key}.txt")
+        words = read_mem(folder / f"expected_{key}.mem")
+        if key.startswith("spk"):
+            expected[key] = unpack_bits(words, trace.shape[1])
+        else:
+            expected[key] = to_signed(words, CONFIG["mem_bits"]).reshape(trace.shape)
+    expected["out"] = unpack_bits(read_mem(folder / "expected_out.mem"), r["out"].shape[1])
+    expected["counts"] = np.array(read_mem(folder / "expected_counts.mem"))
+    expected["decision"] = read_mem(folder / "expected_decision.mem")[0]
+
+    ok = True
+    for key, value in expected.items():
+        if not np.array_equal(value, r[key]):
+            print(f"  MISMATCH in {key}")
             ok = False
-    lines = [ln for ln in (folder / "expected_out.txt").read_text().split("\n") if ln.strip()]
-    out = np.array([[int(x) for x in ln.split()] for ln in lines[:-1]])
-    summary = [int(x) for x in lines[-1].split()]
-    if not np.array_equal(out, r["out"]) or summary != [*r["counts"].tolist(), r["decision"]]:
-        print("  MISMATCH in expected_out.txt")
-        ok = False
     print(f"{folder.name}: {'PASS' if ok else 'FAIL'}")
     return ok
 
 
 if __name__ == "__main__":
     here = Path(__file__).parent
-    folders = [here] + sorted(p for p in here.iterdir() if (p / "input_spikes.txt").exists())
+    folders = [here] + sorted(p for p in here.iterdir() if (p / "input_spikes.mem").exists())
     results = [check_case(f) for f in folders]
     raise SystemExit(0 if all(results) else 1)
