@@ -1,0 +1,92 @@
+# ===== AI assistant files =====
+CLAUDE.md
+claude.md
+CLAUDE.local.md
+.claude/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Environment variables
+.env
+
+# ===== Verilog / HDL simulation =====
+# Icarus Verilog
+*.vvp
+a.out
+
+# Waveforms
+*.vcd
+*.fst
+*.ghw
+*.wlf
+*.vpd
+
+# Verilator
+obj_dir/
+
+# ModelSim / Questa
+work/
+transcript
+modelsim.ini
+vsim.wlf
+
+# Vivado
+*.jou
+*.log
+*.str
+.Xil/
+*.cache/
+*.hw/
+*.runs/
+*.sim/
+*.ip_user_files/
+*.gen/
+
+# Quartus
+db/
+incremental_db/
+output_files/
+*.qws
+
+# Yosys / synthesis outputs
+*.blif
+*.edif
+
+# ===== Editors / OS =====
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
