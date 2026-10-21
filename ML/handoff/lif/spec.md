@@ -10,8 +10,8 @@ The **math rules** must match exactly; ML will tell you before changing them.
 | Name | Value | Notes |
 |---|---|---|
 | `N_IN` | 46 | 23 EEG channels x 2 (UP, DOWN) |
-| `T` | 128 | timesteps per window (0.5 s at 256 Hz) |
-| `WINDOW_STEP` | 64 | new window every 64 samples (0.25 s) |
+| `T` | 128 | timesteps per window (1 s at 128 Hz) |
+| `WINDOW_STEP` | 64 | new window every 64 samples (0.5 s) |
 | Weight type | signed int8 | |
 | Membrane type | signed int16, saturating | [-32768, 32767] |
 
@@ -26,6 +26,16 @@ Input line order: line `2*ch` = UP spike of channel `ch`, line `2*ch + 1` = DOWN
 | `K` (leak shift) | 5 | |
 | `THETA` | 64 | same threshold for both layers |
 | Bias | none | |
+
+Time scale: one timestep = one EEG sample at 128 Hz, so a 128-step window is
+1 s, with a new window every 0.5 s. The leak
+`K = 5` gives decay `1 - 2^-5` per step, a time constant of about
+31.5 steps = 0.25 s.
+
+Input spikes come from per-channel delta modulation in Python: each channel is divided by a
+fixed per-channel scale, then thresholded at `alpha = 0.3` (so each channel has its
+own threshold `d_c = alpha * scale_c`). None of this is visible to hardware, which just reads
+the spike raster.
 
 ### Math, per timestep, per layer
 
@@ -88,5 +98,6 @@ Notes:
 | `.` | random int8 weights, 5% random input spikes | input density 0.050, mem_l1 range [-2315, 903], spk_l1 density 0.245, mem_l2 range [-1633, 11237], output counts [127, 68], decision 0 |
 | `saturation` | hidden 0-15 all +127, 16-31 all -128; all inputs on for t < 64, then off. Hits both int16 rails, then leaks. The + rail appears as 32703 (32767 minus reset) | input density 0.500, mem_l1 range [-32768, 32703], spk_l1 density 0.438, mem_l2 range [-11585, -81], output counts [0, 0], decision 0 |
 | `dense` | random weights, 30% input spikes (heavy load) | input density 0.285, mem_l1 range [-12852, 9504], spk_l1 density 0.379, mem_l2 range [-13644, 552], output counts [27, 0], decision 0 |
+| `seizure` | random l1, l2 column 0 all -128 and column 1 all +127, 5% input spikes. Decision = 1 | input density 0.045, mem_l1 range [-1999, 502], spk_l1 density 0.141, mem_l2 range [-32768, 32703], output counts [0, 128], decision 1 |
 
 Weights are random for now. Trained weights will come in the same format.

@@ -131,8 +131,8 @@ The **math rules** must match exactly; ML will tell you before changing them.
 | Name | Value | Notes |
 |---|---|---|
 | `N_IN` | {c['n_inputs']} | {c['n_channels']} EEG channels x 2 (UP, DOWN) |
-| `T` | {c['window_len']} | timesteps per window (0.5 s at {c['fs']} Hz) |
-| `WINDOW_STEP` | {c['window_step']} | new window every {c['window_step']} samples (0.25 s) |
+| `T` | {c['window_len']} | timesteps per window ({c['window_len'] / c['fs']:g} s at {c['fs']} Hz) |
+| `WINDOW_STEP` | {c['window_step']} | new window every {c['window_step']} samples ({c['window_step'] / c['fs']:g} s) |
 | Weight type | signed int{c['weight_bits']} | |
 | Membrane type | signed int{c['mem_bits']}, saturating | [{-2 ** (c['mem_bits'] - 1)}, {2 ** (c['mem_bits'] - 1) - 1}] |
 
