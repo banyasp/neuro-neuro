@@ -5,9 +5,9 @@ from pathlib import Path
 
 import numpy as np
 
-CONFIG = {'fs': 256,
+CONFIG = {'fs': 128,
  'n_channels': 23,
- 'delta_threshold': 0.3,
+ 'delta_alpha': 0.3,
  'window_len': 128,
  'window_step': 64,
  'n_inputs': 46,
@@ -26,7 +26,9 @@ V_MAX = 2 ** (CONFIG["mem_bits"] - 1) - 1
 
 
 def weight_shapes(cfg=CONFIG):
-    """Name -> shape of every int8 weight array. Files are weights_<name>.mem."""
+    """Name -> shape of every int8 weight array. Files are weights_<name>.mem.
+    Uses cfg["n_inputs"] (= N_IN) because this function is copied into the standalone
+    reference, which only has CONFIG."""
     return {"l1": (cfg["n_inputs"], cfg["n_hidden"]),
             "l2": (cfg["n_hidden"], cfg["n_outputs"])}
 

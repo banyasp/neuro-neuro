@@ -90,3 +90,10 @@ output_files/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ===== Data (CHB-MIT download and preprocess.py outputs) =====
+ML/data/raw/
+ML/data/cache/
+
+# ===== Training runs (train.py default --out) =====
+ML/runs/
