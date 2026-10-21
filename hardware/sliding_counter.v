@@ -16,5 +16,11 @@ module sliding_window(input A, input clk, input rst, output reg [15:0] total_cou
 			shift_reg <= {shift_reg{14:0}, A};
 			
 			// case for the accumulator
-			case({})
+			case({spike_out, A})
+				2'b10: total_count <= total_count + 1'b1;
+				2'b01: total_count <= total_count + 1'b1;
+				2'b11: total_count <= total_count + 2'b11;
+			endcase 
+		end
+endmodule 
 	

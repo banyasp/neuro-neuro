@@ -5,4 +5,13 @@ module arbitrar(input stream_a, input stream_b, output class);
 	// then compare the two accumulations via a > operator.
 	// this is a simple hardware topology to compare outputs of the model.
 
+	wire [31:0] model_A_out;
+	wire [31:0] model_B_out;
+
+	// accumulation for model A
+        .sliding_window(.A(stream_A), .clk(clk), .rst(rst), .total_count(model_A_out));	
 	
+	// accumulation for model B
+	.sliding_window(.A(stream_B), .clk(clk), .rst(rst), .total_count(model_B_out));
+
+	// decision maker here 
