@@ -40,4 +40,7 @@ Rules:
   `forward(x, qat=False) -> (output spike counts [B, n_out], mean hidden spike rate)`, where
   `qat=True` computes exactly what `run_int_reference` does; `clamp_weights()`; `quantize()` ->
   `{name: int8 array}`; and `load_int_weights(weights)`. See `LIFNet` in `lif.py`.
-- Software-only models (e.g. the 1D-CNN baseline) don't need any of this; they never get exported.
+- Software-only models (e.g. `cnn.py`) don't need any of this; they never get exported. They only need
+  `CONFIG` and `Net` with the same `forward(x, qat=False) -> (logits [B, n_out], activity)` signature.
+  `train.py` sees there's no `run_int_reference` and runs float training only (no QAT, int8, agreement
+  check or handoff), saving `weights.pt` instead of `weights_int8.npz`. Decision = logit 1 > logit 0.
