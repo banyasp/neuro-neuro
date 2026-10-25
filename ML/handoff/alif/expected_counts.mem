@@ -1,0 +1,3 @@
+// expected_counts: 2 words, unsigned 16-bit spike count per output neuron
+007f
+003f

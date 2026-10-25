@@ -6,8 +6,10 @@ Models, integer references, and the hardware handoff for the neuromorphic seizur
 |---|---|
 | `common.py` | Spec shared by every model: `CHANNELS`, `N_IN`, `FS`, window size, input encoding, int8/int16 ranges, `spike_fn` surrogate for training |
 | `lif.py` | Model A: LIF SNN N_IN -> 64 -> 2 (integer reference + float training model) |
+| `alif.py` | Model B: adaptive-threshold (ALIF) SNN N_IN -> 64 -> 2. Same inputs, outputs and decision as `lif`; hidden neurons add an adaptation register. Reuses `lif.py`'s output layer and `LIFNet` weight handling |
+| `cnn.py` | Baseline: small 1D CNN on the same spike windows, logits instead of spike counts. Software only (never exported) |
 | `train.py` | Per-patient training: float -> QAT -> int8, agreement check vs the integer reference, real-window handoff. `python train.py --patient chb01` (`--help` for options) |
-| `export.py` | Writes `handoff/<model>/` for any model: `python export.py lif` |
+| `export.py` | Writes `handoff/<model>/` for any hardware model: `python export.py lif alif` |
 | `data/` | CHB-MIT pipeline: `preprocess.py` (EDF -> spike cache), `dataset.py` (windows, labels, split). See `data/CLAUDE.md` |
 | `handoff/` | What the hardware team gets. Generated; don't edit by hand |
 
