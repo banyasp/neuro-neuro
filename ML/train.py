@@ -12,6 +12,8 @@ Stages
      (plain rounding, no fine-tuning) is evaluated first, so QAT can only improve on it.
   Then quantize to int8 and run validation windows through run_int_reference: output counts
   must agree 100% with the QAT forward pass, or the script fails (op-order or saturation bug).
+  Software-only models (no run_int_reference, e.g. --model cnn) run stage 1 only and skip the
+  int8 / agreement / handoff steps; their outputs are logits instead of spike counts.
 
 Metrics use the hardware decision rule (count1 > count0, tie = no seizure). There is no
 probability threshold to tune, because hardware can't apply one. The knobs that move the
@@ -23,10 +25,11 @@ Early stopping uses window-level F1 on validation (accuracy is meaningless at ~1
 
 Outputs in <out>/<patient>_<model>_s<seed>/:
   last.pt            checkpoint, rewritten every epoch (for --resume)
-  weights_int8.npz   int8 weights, {"l1": [N_IN, H], "l2": [H, 2]}
+  weights_int8.npz   int8 weights, {"l1": [N_IN, H], "l2": [H, 2]}  (software-only models: weights.pt)
   results.json       patient, seed, split, val metrics, alarm sweep, agreement, spike densities
   handoff/           golden vectors from real val windows in the export.py format:
                      "." decides seizure, background/ doesn't. Check with handoff/reference_<model>.py
+                     (not for software-only models)
   test_results.json  only after --test
 """
 
@@ -54,7 +57,7 @@ MARGINS = (0, 1, 2, 4, 8)    # count1 - count0 > margin. Only 0 is the current s
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--patient", required=True, help="e.g. chb01")
-    p.add_argument("--model", default="lif", help="module name; must provide Net, CONFIG, run_int_reference")
+    p.add_argument("--model", default="lif", help="module name: lif, alif, or cnn (software-only baseline)")
     p.add_argument("--window", type=float, default=WINDOW / FS, help="window length in seconds (step = half)")
     p.add_argument("--epochs", type=int, default=200, help="max stage-1 epochs (early stopping usually ends sooner)")
     p.add_argument("--qat-epochs", type=int, default=20)
@@ -87,6 +90,11 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.backends.cuda.matmul.allow_tf32 = False  # QAT sums must stay exact integers
+
+
+def is_hardware(model_mod):
+    """Hardware models have an integer reference; software-only ones (cnn) don't."""
+    return hasattr(model_mod, "run_int_reference")
 
 
 def clone_state(model):
@@ -177,13 +185,14 @@ def split_hours(recordings, split):
 
 @torch.no_grad()
 def predict(model, ds, qat, device, batch=1024):
-    """Output spike counts [n, n_outputs] for every window of ds in order, plus mean hidden and input rates."""
+    """Output spike counts [n, n_outputs] (logits for software-only models) for every window of ds
+    in order, plus mean hidden and input rates."""
     model.eval()
     counts, hidden, inputs = [], 0.0, 0.0
     for x, _ in DataLoader(ds, batch_size=batch):
         x = x.to(device)
         c, h = model(x, qat=qat)
-        counts.append(c.round().long().cpu())
+        counts.append(c.round().long().cpu() if qat else c.cpu())   # float-mode counts are already whole
         hidden += float(h) * len(x)
         inputs += float(x.mean()) * len(x)
     n = max(1, len(ds))
@@ -219,7 +228,8 @@ def train_epoch(model, ds, draw, qat, opt, class_w, args, device):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        model.clamp_weights()                   # keep weights inside the int8 grid
+        if hasattr(model, "clamp_weights"):
+            model.clamp_weights()               # keep weights inside the int8 grid
         total += loss.item() * len(x)
     return total / len(idx)
 
@@ -231,9 +241,10 @@ def fmt(m):
             f"FP/h {f(m['fp_per_hour'], '.1f')}  hidden {m['hidden_rate']:.3f}")
 
 
-def train(model, ds_train, ds_val, val_hours, args, device, run_dir):
-    """Stage 1 (float) then stage 2 (QAT), with early stopping and a checkpoint every epoch.
-    Leaves the best stage-2 weights in model. Returns (history, stage-1 best val, PTQ val)."""
+def train(model, ds_train, ds_val, val_hours, args, device, run_dir, hw=True):
+    """Stage 1 (float) then stage 2 (QAT, hardware models only), with early stopping and a
+    checkpoint every epoch. Leaves the best weights of the last stage in model.
+    Returns (history, summaries)."""
     ckpt_path = run_dir / "last.pt"
     class_w = torch.tensor([1.0, args.pos_weight], device=device)
     ck = None
@@ -246,7 +257,8 @@ def train(model, ds_train, ds_val, val_hours, args, device, run_dir):
     stage1_best = ck["stage1_best"] if ck else None
     summaries = ck["summaries"] if ck else {}
 
-    for stage, qat, lr, max_epochs in ((1, False, args.lr, args.epochs), (2, True, args.qat_lr, args.qat_epochs)):
+    stages = [(1, False, args.lr, args.epochs), (2, True, args.qat_lr, args.qat_epochs)][: 2 if hw else 1]
+    for stage, qat, lr, max_epochs in stages:
         if ck and ck["stage"] > stage:
             continue
         opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
@@ -291,6 +303,8 @@ def train(model, ds_train, ds_val, val_hours, args, device, run_dir):
             # Mark stage 1 done, so --resume after this point goes straight to stage 2
             torch.save({"stage": 2, "epoch": 0, "history": history, "stage1_best": stage1_best,
                         "summaries": summaries, "model": None}, ckpt_path)
+    if not hw:
+        model.load_state_dict(stage1_best)   # also covers --resume after stage 1 finished
     return history, summaries
 
 
@@ -388,25 +402,30 @@ def run_test(args, model_mod, run_dir, recordings, window, step, device):
     if out.exists() and not args.force:
         raise SystemExit(f"{out} exists: the test set is evaluated once. Use --force to override.")
     results = json.loads((run_dir / "results.json").read_text())
-    weights = dict(np.load(run_dir / "weights_int8.npz"))
+    hw = is_hardware(model_mod)
     model = model_mod.Net().to(device)
-    model.load_int_weights(weights)
+    if hw:
+        weights = dict(np.load(run_dir / "weights_int8.npz"))
+        model.load_int_weights(weights)
+    else:
+        model.load_state_dict(torch.load(run_dir / "weights.pt", map_location=device))
     ds = WindowDataset(recordings, "test", window, step)
     hours = split_hours(recordings, "test")
-    counts, hidden, inputs = predict(model, ds, True, device)
-    checked, count_bad, dec_bad = verify(model_mod, weights, ds, counts, args.verify_n, args.seed)
+    counts, hidden, inputs = predict(model, ds, hw, device)
+    checked, count_bad, dec_bad = verify(model_mod, weights, ds, counts, args.verify_n, args.seed) if hw else (0, 0, 0)
     n = results["alarm_n"]
     test = {"window": window_metrics(decide(counts), ds.labels, hours),
             "alarm": alarm_metrics(ds, decide(counts), n, hours),
             "alarm_sweep": [alarm_metrics(ds, decide(counts), k, hours) for k in ALARM_NS],
             "hours": hours, "hidden_rate": hidden, "input_rate": inputs,
-            "agreement": {"checked": checked, "count_mismatches": count_bad, "decision_mismatches": dec_bad}}
+            "agreement": {"checked": checked, "count_mismatches": count_bad, "decision_mismatches": dec_bad} if hw else None}
     out.write_text(to_json(test))
     w, a = test["window"], test["alarm"]
     print(f"TEST ({hours:.1f} h): window sens {w['sensitivity']}, spec {w['specificity']}, FP/h {w['fp_per_hour']}")
     print(f"  alarms (N = {n}): detected {a['detected']}/{a['seizures']}, FA/h {a['fa_per_hour']}, "
           f"mean delay {a['mean_delay_s']} s")
-    print(f"  agreement with run_int_reference: {checked - count_bad}/{checked}")
+    if hw:
+        print(f"  agreement with run_int_reference: {checked - count_bad}/{checked}")
     print(f"wrote {out}")
     if count_bad:
         raise SystemExit("FAIL: QAT forward and run_int_reference disagree on test windows")
@@ -421,6 +440,7 @@ def main():
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_mod = importlib.import_module(args.model)
+    hw = is_hardware(model_mod)
 
     window = round(args.window * FS)
     step = window // 2
@@ -447,35 +467,41 @@ def main():
         print("WARNING: no seizure windows in validation; early stopping will minimise false positives only")
 
     model = model_mod.Net().to(device)
-    history, summaries = train(model, ds_train, ds_val, val_hours, args, device, run_dir)
+    history, summaries = train(model, ds_train, ds_val, val_hours, args, device, run_dir, hw)
 
-    # Quantize, then score validation with the integer-exact QAT forward
-    weights = model.quantize()
-    final = evaluate(model, ds_val, val_hours, True, device)
+    # Hardware models: quantize, then score validation with the integer-exact QAT forward.
+    # Software-only models: score the float model as is.
+    final = evaluate(model, ds_val, val_hours, hw, device)
     counts = final.pop("counts")
-    print(f"\nfinal int8 model, val: {fmt(final)}")
+    print(f"\nfinal {'int8' if hw else 'float'} model, val: {fmt(final)}")
     margins, sweep, alarm_n = report_val(ds_val, counts, val_hours)
 
-    checked, count_bad, dec_bad = verify(model_mod, weights, ds_val, counts, args.verify_n, args.seed)
-    agreement = {"checked": checked, "count_mismatches": count_bad, "decision_mismatches": dec_bad,
-                 "rate": (checked - count_bad) / max(1, checked)}
-    print(f"\nagreement with run_int_reference on {checked} val windows: "
-          f"{count_bad} count mismatches, {dec_bad} decision mismatches")
-
-    np.savez(run_dir / "weights_int8.npz", **weights)
+    if hw:
+        weights = model.quantize()
+        checked, count_bad, dec_bad = verify(model_mod, weights, ds_val, counts, args.verify_n, args.seed)
+        agreement = {"checked": checked, "count_mismatches": count_bad, "decision_mismatches": dec_bad,
+                     "rate": (checked - count_bad) / max(1, checked)}
+        print(f"\nagreement with run_int_reference on {checked} val windows: "
+              f"{count_bad} count mismatches, {dec_bad} decision mismatches")
+        weights_path = run_dir / "weights_int8.npz"
+        np.savez(weights_path, **weights)
+    else:
+        count_bad, agreement = 0, None
+        weights_path = run_dir / "weights.pt"
+        torch.save(model.state_dict(), weights_path)
     results = {"patient": args.patient, "model": args.model, "seed": args.seed, "window": window, "step": step,
                "args": vars(args), "split": splits, "val": final, "val_by_margin": margins,
                "alarm_sweep": sweep, "alarm_n": alarm_n, "agreement": agreement,
                "density": {"input": final["input_rate"], "hidden": final["hidden_rate"]},
                "summaries": summaries, "history": history}
     (run_dir / "results.json").write_text(to_json(results))
-    print(f"wrote {run_dir / 'weights_int8.npz'} and results.json")
+    print(f"wrote {weights_path} and results.json")
 
     if count_bad:
         raise SystemExit(f"FAIL: {count_bad}/{checked} windows disagree between the QAT forward and "
                          "run_int_reference (op-order bug, or int16 saturation inside a sum). Not exporting.")
 
-    if window == WINDOW:
+    if hw and window == WINDOW:
         note = (f"Weights are TRAINED ({args.patient}, seed {args.seed}); input spikes are real EEG "
                 "windows from the validation set.")
         export_handoff(model_mod, weights, ds_val, counts, run_dir / "handoff", note)
