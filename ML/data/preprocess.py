@@ -129,23 +129,37 @@ def delta_encode(x, d):
 # Split
 # ---------------------------------------------------------------------------
 
-def chronological_split(hours, n_seizures):
-    """Files in time order -> list of "train"/"val"/"test".
+def chronological_split(hours, n_seizures, target=(0.6, 0.2, 0.2)):
+    """Files in time order -> list of "train"/"val"/"test" (earliest files train, latest test).
 
-    Earliest ~60% of hours -> train, next ~20% -> val, rest -> test, with cuts at file
-    boundaries moved so train and test each contain at least one seizure.
+    Tries every pair of cut points at file boundaries and keeps the one closest to 60/20/20 in
+    both recording hours and seizure count, with at least one seizure in every split (val needs
+    seizures for early stopping, test for the final score). With seizures in only 2 files,
+    val is allowed to be seizure-free.
     """
-    hours, n_seizures = np.asarray(hours), np.asarray(n_seizures)
-    seizure_files = np.flatnonzero(n_seizures > 0)
-    if len(seizure_files) < 2:
+    hours, n_seizures = np.asarray(hours, dtype=float), np.asarray(n_seizures)
+    n_files_with_seizures = int((n_seizures > 0).sum())
+    if n_files_with_seizures < 2:
         raise ValueError("need seizures in at least 2 files (one for train, one for test)")
-    end = np.cumsum(hours) / hours.sum()          # fraction of hours at the end of each file
-    n1 = int(np.argmin(np.abs(end - 0.6))) + 1    # files [0, n1) -> train
-    n2 = int(np.argmin(np.abs(end - 0.8))) + 1    # files [n1, n2) -> val, [n2, end) -> test
-    first, last = seizure_files[0], seizure_files[-1]
-    n1 = min(max(n1, first + 1), last)
-    n2 = min(max(n2, n1), last)
-    return ["train"] * n1 + ["val"] * (n2 - n1) + ["test"] * (len(hours) - n2)
+    need_val_seizure = n_files_with_seizures >= 3
+    cum_h = np.concatenate([[0], np.cumsum(hours)])
+    cum_s = np.concatenate([[0], np.cumsum(n_seizures)])
+    target = np.array(target)
+    n = len(hours)
+    best = None
+    for n1 in range(1, n - 1):            # files [0, n1) -> train
+        for n2 in range(n1 + 1, n):       # files [n1, n2) -> val, [n2, n) -> test
+            h = np.array([cum_h[n1], cum_h[n2] - cum_h[n1], cum_h[n] - cum_h[n2]]) / cum_h[n]
+            sz = np.array([cum_s[n1], cum_s[n2] - cum_s[n1], cum_s[n] - cum_s[n2]])
+            if sz[0] == 0 or sz[2] == 0 or (need_val_seizure and sz[1] == 0):
+                continue
+            cost = np.abs(h - target).sum() + np.abs(sz / cum_s[n] - target).sum()
+            if best is None or cost < best[0]:
+                best = (cost, n1, n2)
+    if best is None:
+        raise ValueError("no chronological split gives every split a seizure")
+    _, n1, n2 = best
+    return ["train"] * n1 + ["val"] * (n2 - n1) + ["test"] * (n - n2)
 
 
 # ---------------------------------------------------------------------------
