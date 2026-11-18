@@ -4,6 +4,7 @@ Train one model for one patient: float training, QAT fine-tuning, int8 weights, 
     # from ML/ (on Colab, point --cache and --out at Google Drive)
     python train.py --patient chb01 --cache /content/drive/MyDrive/neuro/cache --out /content/drive/MyDrive/neuro/runs
     python train.py --patient chb01 ... --resume   # continue after a disconnect (same arguments)
+    python train.py --patient chb01 ... --rescore  # redo the val alarm / margin report from saved weights
     python train.py --patient chb01 ... --test     # ONCE, at the very end: score the saved weights on test
 
 Stages
@@ -16,7 +17,9 @@ Stages
   int8 / agreement / handoff steps; their outputs are logits instead of spike counts.
 
 Metrics use the hardware decision rule (count1 > count0, tie = no seizure). There is no
-probability threshold to tune, because hardware can't apply one. The knobs that move the
+probability threshold to tune, because hardware can't apply one. The one exception is the
+margin ablation: validation is also scored with count1 - count0 > m for m in MARGINS, jointly
+with the alarm N, and the best (m, N) is saved next to the m = 0 spec choice. The knobs that move the
 sensitivity / false-alarm trade-off are training ones: --neg-per-pos (the 1:N undersampling
 sets the prior the model learns) and --pos-weight. Class weights are deliberately mild (1.2x,
 as in [Mehrabi 2026]) rather than inverse-frequency: on top of 1:4 sampling, full balancing
@@ -26,11 +29,12 @@ Early stopping uses window-level F1 on validation (accuracy is meaningless at ~1
 Outputs in <out>/<patient>_<model>_s<seed>/:
   last.pt            checkpoint, rewritten every epoch (for --resume)
   weights_int8.npz   int8 weights, {"l1": [N_IN, H], "l2": [H, 2]}  (software-only models: weights.pt)
-  results.json       patient, seed, split, val metrics, alarm sweep, agreement, spike densities
+  results.json       patient, seed, split, val metrics, alarm sweep, margin sweep, agreement, densities
+  val_outputs.npz    per-window val outputs (counts, labels, recording, start), for the voter
   handoff/           golden vectors from real val windows in the export.py format:
                      "." decides seizure, background/ doesn't. Check with handoff/reference_<model>.py
                      (not for software-only models)
-  test_results.json  only after --test
+  test_results.json  only after --test (spec result and best-margin result), plus test_outputs.npz
 """
 
 import argparse
@@ -51,7 +55,9 @@ from data.dataset import CACHE_DIR, WindowDataset, balanced_indices, load_record
 
 ALARM_NS = range(1, 11)      # persistence rule sweep: alarm after N consecutive positive windows
 TARGET_FA_PER_HOUR = 0.2     # [Proposal]
-MARGINS = (0, 1, 2, 4, 8)    # count1 - count0 > margin. Only 0 is the current spec
+# Decision margin ablation: seizure if count1 - count0 > margin. Only 0 is the current hardware
+# spec; any other value is a (cheap) spec change, so it's reported next to the spec result.
+MARGINS = (0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 
 
 def parse_args():
@@ -78,6 +84,8 @@ def parse_args():
     p.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "runs")
     p.add_argument("--verify-n", type=int, default=2000, help="windows checked against run_int_reference (0 = all)")
     p.add_argument("--resume", action="store_true", help="continue from <run>/last.pt")
+    p.add_argument("--rescore", action="store_true",
+                   help="redo the validation alarm / margin report from saved weights (no training)")
     p.add_argument("--test", action="store_true", help="evaluate saved weights on the test split (once)")
     p.add_argument("--force", action="store_true", help="let --test run again")
     return p.parse_args()
@@ -131,12 +139,13 @@ def seizure_intervals(mask):
     return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
 
 
-def alarm_metrics(ds, decisions, n_consec, hours):
+def alarm_metrics(ds, decisions, n_consec, hours, margin=0):
     """Event-level scoring, replaying each recording in time order.
 
     An alarm fires at the end of the N-th consecutive positive window and lasts until the run of
     positives ends. It's a true alarm if it overlaps an annotated seizure, else a false alarm.
     Delay = alarm time - seizure onset in seconds (negative = before the annotated onset).
+    margin is only recorded in the result (the decisions were already made with it).
     """
     n_seizures, false_alarms, delays = 0, 0, []
     for r in np.unique(ds.rec):
@@ -159,20 +168,32 @@ def alarm_metrics(ds, decisions, n_consec, hours):
                 if first_alarm[j] is None:
                     first_alarm[j] = t_alarm
         delays += [(t - on) / FS for (on, _), t in zip(seizures, first_alarm) if t is not None]
-    return {"n_consec": n_consec, "seizures": n_seizures, "detected": len(delays),
+    return {"margin": margin, "n_consec": n_consec, "seizures": n_seizures, "detected": len(delays),
             "sensitivity": ratio(len(delays), n_seizures), "false_alarms": false_alarms,
             "fa_per_hour": ratio(false_alarms, hours),
             "mean_delay_s": float(np.mean(delays)) if delays else None,
             "max_delay_s": float(np.max(delays)) if delays else None}
 
 
-def choose_n(sweep):
-    """Best persistence N on validation: highest event sensitivity with FA/h under target
-    (smallest N on ties, since each extra window adds 0.5 s of delay); else fewest false alarms."""
-    ok = [a for a in sweep if a["fa_per_hour"] is not None and a["fa_per_hour"] < TARGET_FA_PER_HOUR]
-    if ok and any(a["sensitivity"] is not None for a in ok):
-        return max(ok, key=lambda a: (a["sensitivity"] or 0, -a["n_consec"]))["n_consec"]
-    return min(sweep, key=lambda a: (a["false_alarms"], a["n_consec"]))["n_consec"]
+def choose_alarm(sweep):
+    """Best alarm setting from a list of alarm_metrics results (any mix of margins and N).
+
+    Only settings that detect at least one seizure count (silence trivially has zero false alarms).
+    1. Under the FA/h target: highest event sensitivity, then shortest mean delay.
+    2. Target not reachable: fewest false alarms, then highest sensitivity, then shortest delay.
+    3. Nothing detects anything (or no seizures in the split): fewest false alarms.
+    Remaining ties go to the smallest N, then the smallest margin."""
+    def delay(a):
+        return a["mean_delay_s"] if a["mean_delay_s"] is not None else float("inf")
+
+    detects = [a for a in sweep if a["detected"] > 0]
+    under = [a for a in detects if a["fa_per_hour"] is not None and a["fa_per_hour"] < TARGET_FA_PER_HOUR]
+    if under:
+        return min(under, key=lambda a: (-a["sensitivity"], delay(a), a["n_consec"], a["margin"]))
+    if detects:
+        return min(detects, key=lambda a: (a["false_alarms"], -a["sensitivity"], delay(a),
+                                           a["n_consec"], a["margin"]))
+    return min(sweep, key=lambda a: (a["false_alarms"], a["n_consec"], a["margin"]))
 
 
 def split_hours(recordings, split):
@@ -379,21 +400,70 @@ def split_info(recordings, window, step):
     return info
 
 
-def report_val(ds, counts, hours):
-    """Window metrics at each margin, and the alarm-level sweep over N, on validation."""
-    margins = {m: window_metrics(decide(counts, m), ds.labels, hours) for m in MARGINS}
-    print("\nValidation, window level (margin 0 = current spec; others would need a spec change):")
-    for m, w in margins.items():
-        print(f"  count1 - count0 > {m}:  sens {w['sensitivity'] or 0:.3f}  prec {w['precision'] or 0:.3f}  "
-              f"FP/h {w['fp_per_hour'] or 0:.1f}")
-    sweep = [alarm_metrics(ds, decide(counts), n, hours) for n in ALARM_NS]
-    print(f"\nValidation, alarm level (alarm after N consecutive positive windows, target FA/h < {TARGET_FA_PER_HOUR}):")
-    for a in sweep:
-        print(f"  N = {a['n_consec']:2d}: detected {a['detected']}/{a['seizures']}  FA/h {a['fa_per_hour'] or 0:.2f}  "
-              f"mean delay {a['mean_delay_s'] if a['mean_delay_s'] is not None else float('nan'):.1f} s")
-    n = choose_n(sweep)
-    print(f"  chosen N = {n}")
-    return margins, sweep, n
+def fmt_alarm(a):
+    delay = a["mean_delay_s"] if a["mean_delay_s"] is not None else float("nan")
+    return (f"m = {a['margin']:2d}, N = {a['n_consec']:2d}: detected {a['detected']}/{a['seizures']}  "
+            f"FA/h {a['fa_per_hour'] or 0:.2f}  mean delay {delay:.1f} s")
+
+
+def alarm_report(ds, counts, hours):
+    """Margin x N sweep on validation. Picks the alarm setting twice: at margin 0 (the current
+    hardware spec) and over all margins (the margin ablation). Returns the results.json entries."""
+    margin_sweep = []
+    for m in MARGINS:
+        dec = decide(counts, m)
+        margin_sweep.append({"margin": m, "window": window_metrics(dec, ds.labels, hours),
+                             "alarms": [alarm_metrics(ds, dec, n, hours, m) for n in ALARM_NS]})
+    spec_sweep = margin_sweep[0]["alarms"]
+    spec = choose_alarm(spec_sweep)
+    best = choose_alarm([a for row in margin_sweep for a in row["alarms"]])
+
+    print(f"\nValidation, alarm level (alarm after N consecutive positive windows, margin 0 = spec):")
+    for a in spec_sweep:
+        print(f"  {fmt_alarm(a)}")
+    print(f"\nMargin ablation (seizure if count1 - count0 > m; m > 0 needs a spec change). "
+          f"Best N per margin, target FA/h < {TARGET_FA_PER_HOUR}:")
+    for row in margin_sweep:
+        w = row["window"]
+        print(f"  window sens {w['sensitivity'] or 0:.3f}  prec {w['precision'] or 0:.3f}  "
+              f"FP/h {w['fp_per_hour'] or 0:5.1f}  |  {fmt_alarm(choose_alarm(row['alarms']))}")
+    print(f"  spec choice: {fmt_alarm(spec)}")
+    print(f"  best choice: {fmt_alarm(best)}")
+    return {"alarm_sweep": spec_sweep, "alarm_n": spec["n_consec"], "margin_sweep": margin_sweep,
+            "best_alarm": {"margin": best["margin"], "n_consec": best["n_consec"]}}
+
+
+def save_val_outputs(run_dir, ds, counts):
+    """Per-window validation outputs (for the voter simulation and rescoring without the model)."""
+    np.savez(run_dir / "val_outputs.npz", counts=counts, labels=ds.labels,
+             recording=ds.recording, start=ds.start)
+
+
+def load_trained(model_mod, run_dir, device):
+    """The model from a finished run's saved weights (int8 for hardware models)."""
+    model = model_mod.Net().to(device)
+    if is_hardware(model_mod):
+        weights = dict(np.load(run_dir / "weights_int8.npz"))
+        model.load_int_weights(weights)
+    else:
+        weights = None
+        model.load_state_dict(torch.load(run_dir / "weights.pt", map_location=device))
+    return model, weights
+
+
+def rescore(model_mod, run_dir, recordings, window, step, device):
+    """Redo the validation alarm/margin report from saved weights, without retraining
+    (e.g. for runs made before the margin sweep existed). Updates results.json in place."""
+    path = run_dir / "results.json"
+    results = json.loads(path.read_text())
+    model, _ = load_trained(model_mod, run_dir, device)
+    ds = WindowDataset(recordings, "val", window, step)
+    counts, _, _ = predict(model, ds, is_hardware(model_mod), device)
+    results.pop("val_by_margin", None)          # replaced by margin_sweep
+    results.update(alarm_report(ds, counts, split_hours(recordings, "val")))
+    save_val_outputs(run_dir, ds, counts)
+    path.write_text(to_json(results))
+    print(f"updated {path} and wrote val_outputs.npz")
 
 
 def run_test(args, model_mod, run_dir, recordings, window, step, device):
@@ -402,28 +472,30 @@ def run_test(args, model_mod, run_dir, recordings, window, step, device):
     if out.exists() and not args.force:
         raise SystemExit(f"{out} exists: the test set is evaluated once. Use --force to override.")
     results = json.loads((run_dir / "results.json").read_text())
+    if "best_alarm" not in results:
+        raise SystemExit("results.json predates the margin sweep: run with --rescore first")
     hw = is_hardware(model_mod)
-    model = model_mod.Net().to(device)
-    if hw:
-        weights = dict(np.load(run_dir / "weights_int8.npz"))
-        model.load_int_weights(weights)
-    else:
-        model.load_state_dict(torch.load(run_dir / "weights.pt", map_location=device))
+    model, weights = load_trained(model_mod, run_dir, device)
     ds = WindowDataset(recordings, "test", window, step)
     hours = split_hours(recordings, "test")
     counts, hidden, inputs = predict(model, ds, hw, device)
     checked, count_bad, dec_bad = verify(model_mod, weights, ds, counts, args.verify_n, args.seed) if hw else (0, 0, 0)
     n = results["alarm_n"]
+    m, n_best = results["best_alarm"]["margin"], results["best_alarm"]["n_consec"]
     test = {"window": window_metrics(decide(counts), ds.labels, hours),
             "alarm": alarm_metrics(ds, decide(counts), n, hours),
             "alarm_sweep": [alarm_metrics(ds, decide(counts), k, hours) for k in ALARM_NS],
+            # margin ablation: the (margin, N) picked on validation, applied once to test
+            "best_margin": {"window": window_metrics(decide(counts, m), ds.labels, hours),
+                            "alarm": alarm_metrics(ds, decide(counts, m), n_best, hours, m)},
             "hours": hours, "hidden_rate": hidden, "input_rate": inputs,
             "agreement": {"checked": checked, "count_mismatches": count_bad, "decision_mismatches": dec_bad} if hw else None}
     out.write_text(to_json(test))
-    w, a = test["window"], test["alarm"]
+    np.savez(run_dir / "test_outputs.npz", counts=counts, labels=ds.labels, recording=ds.recording, start=ds.start)
+    w = test["window"]
     print(f"TEST ({hours:.1f} h): window sens {w['sensitivity']}, spec {w['specificity']}, FP/h {w['fp_per_hour']}")
-    print(f"  alarms (N = {n}): detected {a['detected']}/{a['seizures']}, FA/h {a['fa_per_hour']}, "
-          f"mean delay {a['mean_delay_s']} s")
+    print(f"  spec alarms:        {fmt_alarm(test['alarm'])}")
+    print(f"  best-margin alarms: {fmt_alarm(test['best_margin']['alarm'])}")
     if hw:
         print(f"  agreement with run_int_reference: {checked - count_bad}/{checked}")
     print(f"wrote {out}")
@@ -455,6 +527,9 @@ def main():
     if args.test:
         run_test(args, model_mod, run_dir, recordings, window, step, device)
         return
+    if args.rescore:
+        rescore(model_mod, run_dir, recordings, window, step, device)
+        return
 
     splits = split_info(recordings, window, step)
     for split, s in splits.items():
@@ -474,7 +549,8 @@ def main():
     final = evaluate(model, ds_val, val_hours, hw, device)
     counts = final.pop("counts")
     print(f"\nfinal {'int8' if hw else 'float'} model, val: {fmt(final)}")
-    margins, sweep, alarm_n = report_val(ds_val, counts, val_hours)
+    report = alarm_report(ds_val, counts, val_hours)
+    save_val_outputs(run_dir, ds_val, counts)
 
     if hw:
         weights = model.quantize()
@@ -490,8 +566,7 @@ def main():
         weights_path = run_dir / "weights.pt"
         torch.save(model.state_dict(), weights_path)
     results = {"patient": args.patient, "model": args.model, "seed": args.seed, "window": window, "step": step,
-               "args": vars(args), "split": splits, "val": final, "val_by_margin": margins,
-               "alarm_sweep": sweep, "alarm_n": alarm_n, "agreement": agreement,
+               "args": vars(args), "split": splits, "val": final, **report, "agreement": agreement,
                "density": {"input": final["input_rate"], "hidden": final["hidden_rate"]},
                "summaries": summaries, "history": history}
     (run_dir / "results.json").write_text(to_json(results))
