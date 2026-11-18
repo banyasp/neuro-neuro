@@ -58,6 +58,10 @@ TARGET_FA_PER_HOUR = 0.2     # [Proposal]
 # Decision margin ablation: seizure if count1 - count0 > margin. Only 0 is the current hardware
 # spec; any other value is a (cheap) spec change, so it's reported next to the spec result.
 MARGINS = (0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
+# SzCORE event-scoring defaults (their timescoring package), in seconds [SzCORE]
+SZ_BEFORE_S, SZ_AFTER_S = 30, 60   # tolerance around each annotated seizure
+SZ_MERGE_S = 90                    # merge events closer than this
+SZ_MAX_EVENT_S = 300               # split events longer than this
 
 
 def parse_args():
@@ -69,7 +73,8 @@ def parse_args():
     p.add_argument("--qat-epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--qat-lr", type=float, default=2e-4)
-    p.add_argument("--patience", type=int, default=15, help="epochs without val improvement before stopping")
+    p.add_argument("--patience", type=int, default=30,
+                   help="epochs without val improvement before stopping (chb01 sat at F1 ~0.01 for 14 epochs before learning)")
     p.add_argument("--batch", type=int, default=128)
     p.add_argument("--min-steps", type=int, default=50,
                    help="min batches per epoch; with few seizures, several balanced draws are stacked")
@@ -139,39 +144,97 @@ def seizure_intervals(mask):
     return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
 
 
-def alarm_metrics(ds, decisions, n_consec, hours, margin=0):
-    """Event-level scoring, replaying each recording in time order.
+def alarm_events(decisions, starts, window, n_consec):
+    """Persistence rule on one recording's windows (in time order).
 
-    An alarm fires at the end of the N-th consecutive positive window and lasts until the run of
-    positives ends. It's a true alarm if it overlaps an annotated seizure, else a false alarm.
-    Delay = alarm time - seizure onset in seconds (negative = before the annotated onset).
+    An alarm fires at the end of the N-th consecutive positive window. Its event spans the whole
+    run of positive windows. Returns [[alarm time, span start, span end], ...] in samples."""
+    events, run = [], 0
+    for i in range(len(decisions)):
+        run = run + 1 if decisions[i] else 0
+        if run == n_consec:
+            events.append([starts[i] + window, starts[i - n_consec + 1], starts[i] + window])
+        elif run > n_consec:
+            events[-1][2] = starts[i] + window
+    return events
+
+
+def merge_events(events, gap):
+    """Merge events separated by less than gap samples (SzCORE). events sorted by start."""
+    out = []
+    for on, off in events:
+        if out and on - out[-1][1] < gap:
+            out[-1][1] = max(out[-1][1], off)
+        else:
+            out.append([on, off])
+    return out
+
+
+def split_events(events, max_len):
+    """Split events longer than max_len samples into max_len pieces (SzCORE)."""
+    out = []
+    for on, off in events:
+        while off - on > max_len:
+            out.append([on, on + max_len])
+            on += max_len
+        out.append([on, off])
+    return out
+
+
+def szcore_score(seizures, alarms, n_samples):
+    """SzCORE event scoring of one recording, same rules as their `timescoring` package [SzCORE].
+
+    1. Merge events less than 90 s apart, then split events longer than 5 min, in both the
+       annotations and the alarms (so a 7 min seizure counts as 2 reference events).
+    2. A reference event is detected (TP) if any alarm overlaps it, extended by 30 s before
+       onset and 60 s after offset.
+    3. An alarm is a false positive if it overlaps no detected (extended) reference event.
+    seizures, alarms: [[start, end], ...] in samples. Returns (tp, n_reference_events, fp).
+    (timescoring works at 10 Hz; we use the 128 Hz samples directly, which only changes rounding.)
+    """
+    ref = split_events(merge_events(seizures, SZ_MERGE_S * FS), SZ_MAX_EVENT_S * FS)
+    hyp = split_events(merge_events(alarms, SZ_MERGE_S * FS), SZ_MAX_EVENT_S * FS)
+    hyp_mask = np.zeros(n_samples, bool)
+    for on, off in hyp:
+        hyp_mask[on:off] = True
+    tp, tp_mask = 0, np.zeros(n_samples, bool)
+    for on, off in ref:
+        lo, hi = max(0, on - SZ_BEFORE_S * FS), min(n_samples, off + SZ_AFTER_S * FS)
+        if hyp_mask[lo:hi].any():
+            tp += 1
+            tp_mask[lo:hi] = True
+    fp = sum(not tp_mask[on:off].any() for on, off in hyp)
+    return tp, len(ref), fp
+
+
+def alarm_metrics(ds, decisions, n_consec, hours, margin=0):
+    """Event-level scoring with SzCORE rules, replaying each recording in time order.
+
+    Alarms come from the persistence rule (alarm_events) and are scored with szcore_score.
+    Delay, per annotated seizure: first alarm time that overlaps the seizure's tolerance
+    interval minus the annotated onset, in seconds (negative = before the annotated onset).
     margin is only recorded in the result (the decisions were already made with it).
     """
-    n_seizures, false_alarms, delays = 0, 0, []
+    tp = n_ref = fp = n_annotated = 0
+    delays = []
     for r in np.unique(ds.rec):
         sel = np.flatnonzero(ds.rec == r)          # this recording's windows, in time order
-        d, starts = decisions[sel], ds.start[sel]
-        seizures = seizure_intervals(ds.recordings[r]["seizure_mask"])
-        n_seizures += len(seizures)
-        events, run = [], 0                        # [alarm time, span start, span end] in samples
-        for i in range(len(d)):
-            run = run + 1 if d[i] else 0
-            if run == n_consec:
-                events.append([starts[i] + ds.window, starts[i - n_consec + 1], starts[i] + ds.window])
-            elif run > n_consec:
-                events[-1][2] = starts[i] + ds.window
-        first_alarm = [None] * len(seizures)
-        for t_alarm, lo, hi in events:
-            hits = [j for j, (on, off) in enumerate(seizures) if lo < off and hi > on]
-            false_alarms += not hits
-            for j in hits:
-                if first_alarm[j] is None:
-                    first_alarm[j] = t_alarm
-        delays += [(t - on) / FS for (on, _), t in zip(seizures, first_alarm) if t is not None]
-    return {"margin": margin, "n_consec": n_consec, "seizures": n_seizures, "detected": len(delays),
-            "sensitivity": ratio(len(delays), n_seizures), "false_alarms": false_alarms,
-            "fa_per_hour": ratio(false_alarms, hours),
+        mask = ds.recordings[r]["seizure_mask"]
+        seizures = [[int(on), int(off)] for on, off in seizure_intervals(mask)]
+        events = alarm_events(decisions[sel], ds.start[sel], ds.window, n_consec)
+        t, n, f = szcore_score(seizures, [[int(lo), int(hi)] for _, lo, hi in events], len(mask))
+        tp, n_ref, fp, n_annotated = tp + t, n_ref + n, fp + f, n_annotated + len(seizures)
+        for on, off in seizures:
+            lo, hi = on - SZ_BEFORE_S * FS, off + SZ_AFTER_S * FS
+            hits = [t_alarm for t_alarm, a, b in events if a < hi and b > lo]
+            if hits:
+                delays.append((min(hits) - on) / FS)
+    return {"margin": margin, "n_consec": n_consec, "seizures": n_ref, "annotated_seizures": n_annotated,
+            "detected": tp, "sensitivity": ratio(tp, n_ref), "false_alarms": fp,
+            "precision": ratio(tp, tp + fp), "f1": ratio(2 * tp, 2 * tp + fp + (n_ref - tp)),
+            "fa_per_hour": ratio(fp, hours),
             "mean_delay_s": float(np.mean(delays)) if delays else None,
+            "median_delay_s": float(np.median(delays)) if delays else None,
             "max_delay_s": float(np.max(delays)) if delays else None}
 
 
