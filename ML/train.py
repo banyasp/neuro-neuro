@@ -69,6 +69,8 @@ def parse_args():
     p.add_argument("--patient", required=True, help="e.g. chb01")
     p.add_argument("--model", default="lif", help="module name: lif, alif, or cnn (software-only baseline)")
     p.add_argument("--window", type=float, default=WINDOW / FS, help="window length in seconds (step = half)")
+    p.add_argument("--hidden", type=int, help="hidden neurons for lif / alif (default: the model's CONFIG, 64). "
+                                              "Pass the same value again for --resume / --rescore / --test")
     p.add_argument("--epochs", type=int, default=200, help="max stage-1 epochs (early stopping usually ends sooner)")
     p.add_argument("--qat-epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=2e-3)
@@ -507,6 +509,11 @@ def load_trained(model_mod, run_dir, device):
     model = model_mod.Net().to(device)
     if is_hardware(model_mod):
         weights = dict(np.load(run_dir / "weights_int8.npz"))
+        expected = model_mod.weight_shapes()
+        saved = {k: w.shape for k, w in weights.items()}
+        if saved != expected:
+            raise SystemExit(f"saved weights {saved} don't match the model {expected}: "
+                             "pass the same --hidden as when this run was trained")
         model.load_int_weights(weights)
     else:
         weights = None
@@ -523,6 +530,7 @@ def rescore(model_mod, run_dir, recordings, window, step, device):
     ds = WindowDataset(recordings, "val", window, step)
     counts, _, _ = predict(model, ds, is_hardware(model_mod), device)
     results.pop("val_by_margin", None)          # replaced by margin_sweep
+    results["config"] = getattr(model_mod, "CONFIG", None)
     results.update(alarm_report(ds, counts, split_hours(recordings, "val")))
     save_val_outputs(run_dir, ds, counts)
     path.write_text(to_json(results))
@@ -576,15 +584,27 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_mod = importlib.import_module(args.model)
     hw = is_hardware(model_mod)
+    config = getattr(model_mod, "CONFIG", {})
+    hidden_tag = ""
+    if args.hidden is not None:
+        if "n_hidden" not in config:
+            raise SystemExit(f"--hidden: model '{args.model}' has no n_hidden in its CONFIG")
+        if args.hidden != config["n_hidden"]:
+            hidden_tag = f"_h{args.hidden}"
+        # Set it in the module's CONFIG itself: Net, run_int_reference, weight_shapes, spec_md and
+        # the handoff's reference copy all default to cfg=CONFIG (the same dict), so they all see it.
+        config["n_hidden"] = args.hidden
 
     window = round(args.window * FS)
     step = window // 2
     if (window, step) != (WINDOW, STEP):
         print(f"NOTE: window {window} / step {step} differs from the hardware spec ({WINDOW} / {STEP})")
-    tag = f"{args.patient}_{args.model}_s{args.seed}" + ("" if window == WINDOW else f"_w{window}")
+    tag = f"{args.patient}_{args.model}_s{args.seed}" + ("" if window == WINDOW else f"_w{window}") + hidden_tag
     run_dir = args.out / tag
+    if (args.rescore or args.test) and not (run_dir / "results.json").exists():
+        raise SystemExit(f"no finished run at {run_dir} (same --seed / --window / --hidden as training?)")
     run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"device {device}, run dir {run_dir}")
+    print(f"device {device}, run dir {run_dir}" + (f", n_hidden {config['n_hidden']}" if "n_hidden" in config else ""))
 
     recordings = load_recordings([args.patient], args.cache)
     if args.test:
@@ -629,7 +649,7 @@ def main():
         weights_path = run_dir / "weights.pt"
         torch.save(model.state_dict(), weights_path)
     results = {"patient": args.patient, "model": args.model, "seed": args.seed, "window": window, "step": step,
-               "args": vars(args), "split": splits, "val": final, **report, "agreement": agreement,
+               "config": getattr(model_mod, "CONFIG", None), "args": vars(args), "split": splits, "val": final, **report, "agreement": agreement,
                "density": {"input": final["input_rate"], "hidden": final["hidden_rate"]},
                "summaries": summaries, "history": history}
     (run_dir / "results.json").write_text(to_json(results))

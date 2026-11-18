@@ -21,6 +21,7 @@ from common import FS
 
 COLUMNS = [   # (key, header, format)
     ("patient", "patient", "s"), ("model", "model", "s"), ("seed", "seed", "d"), ("window_s", "win s", ".1f"),
+    ("hidden", "hid n", "d"),
     ("val_f1", "F1", ".3f"), ("val_sens", "sens", ".3f"), ("val_prec", "prec", ".3f"),
     ("val_fp_h", "FP/h", ".1f"),
     ("spec_n", "N", "d"), ("spec_detected", "det", "s"), ("spec_fa_h", "FA/h", ".2f"),
@@ -39,6 +40,14 @@ def find(sweep, n, m=0):
     return next(a for a in sweep if a["n_consec"] == n and a.get("margin", 0) == m)
 
 
+def hidden_size(run, r):
+    """n_hidden from results.json, or (runs made before it was saved) from the int8 weights."""
+    n = (r.get("config") or {}).get("n_hidden")
+    if n is None and (run / "weights_int8.npz").exists():
+        n = int(np.load(run / "weights_int8.npz")["l1"].shape[1])
+    return n
+
+
 def row(run):
     r = json.loads((run / "results.json").read_text())
     if "best_alarm" not in r:
@@ -48,7 +57,7 @@ def row(run):
     best = find(next(x["alarms"] for x in r["margin_sweep"] if x["margin"] == m), n, m)
     v = r["val"]
     out = {"run": run.name, "patient": r["patient"], "model": r["model"], "seed": r["seed"],
-           "window_s": r["window"] / FS,
+           "window_s": r["window"] / FS, "hidden": hidden_size(run, r),
            "val_f1": v["f1"], "val_sens": v["sensitivity"], "val_prec": v["precision"], "val_fp_h": v["fp_per_hour"],
            "spec_n": r["alarm_n"], "spec_detected": f"{spec['detected']}/{spec['seizures']}",
            "spec_fa_h": spec["fa_per_hour"], "spec_delay_s": spec["mean_delay_s"],
@@ -102,18 +111,19 @@ def main():
     print("starred = best (m, N) from the margin ablation. det = SzCORE events detected / total.\n")
     print_table(rows, cols)
 
-    print("\nMean +- std across runs, per model and window:")
+    print("\nMean +- std across runs, per model, window and hidden size:")
     groups = defaultdict(list)
     for r in rows:
-        groups[(r["model"], r["window_s"])].append(r)
-    for (model, win), rs in groups.items():
+        groups[(r["model"], r["window_s"], r["hidden"])].append(r)
+    for (model, win, hidden), rs in groups.items():
         parts = []
         for k in MEAN_KEYS:
             vals = [r[k] for r in rs if r.get(k) is not None]
             if vals:
                 parts.append(f"{k} {np.mean(vals):.3g}+-{np.std(vals):.2g}")
         patients = sorted({r["patient"] for r in rs})
-        print(f"  {model} ({win:.1f} s windows; {len(rs)} runs, {len(patients)} patients: {', '.join(patients)})")
+        size = f", {hidden} hidden" if hidden is not None else ""
+        print(f"  {model} ({win:.1f} s windows{size}; {len(rs)} runs, {len(patients)} patients: {', '.join(patients)})")
         for i in range(0, len(parts), 4):
             print("    " + "   ".join(parts[i:i + 4]))
 
