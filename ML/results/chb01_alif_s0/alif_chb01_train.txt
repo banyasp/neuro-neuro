@@ -102,3 +102,32 @@ Validation, alarm level (alarm after N consecutive positive windows, target FA/h
 agreement with run_int_reference on 2000 val windows: 0 count mismatches, 0 decision mismatches
 wrote /content/drive/MyDrive/ECE662/temp/runs/chb01_alif_s0/weights_int8.npz and results.json
 wrote /content/drive/MyDrive/ECE662/temp/runs/chb01_alif_s0/handoff
+device cuda, run dir /content/drive/MyDrive/ECE662/662 Neuromorph/alif-training/runs/chb01_alif_s0, n_hidden 64
+
+Validation, alarm level (alarm after N consecutive positive windows, margin 0 = spec):
+  m =  0, N =  1: detected 2/2  FA/h 7.11  mean delay 2.5 s
+  m =  0, N =  2: detected 2/2  FA/h 1.94  mean delay 4.2 s
+  m =  0, N =  3: detected 2/2  FA/h 0.26  mean delay 5.5 s
+  m =  0, N =  4: detected 2/2  FA/h 0.00  mean delay 6.0 s
+  m =  0, N =  5: detected 2/2  FA/h 0.00  mean delay 6.5 s
+  m =  0, N =  6: detected 2/2  FA/h 0.00  mean delay 7.0 s
+  m =  0, N =  7: detected 2/2  FA/h 0.00  mean delay 7.5 s
+  m =  0, N =  8: detected 2/2  FA/h 0.00  mean delay 8.0 s
+  m =  0, N =  9: detected 2/2  FA/h 0.00  mean delay 8.5 s
+  m =  0, N = 10: detected 2/2  FA/h 0.00  mean delay 9.0 s
+
+Margin ablation (seizure if count1 - count0 > m; m > 0 needs a spec change). Best N per margin, target FA/h < 0.2:
+  window sens 0.580  prec 0.569  FP/h  20.7  |  m =  0, N =  4: detected 2/2  FA/h 0.00  mean delay 6.0 s
+  window sens 0.555  prec 0.643  FP/h  14.5  |  m =  1, N =  3: detected 2/2  FA/h 0.13  mean delay 5.5 s
+  window sens 0.519  prec 0.695  FP/h  10.7  |  m =  2, N =  3: detected 2/2  FA/h 0.13  mean delay 5.5 s
+  window sens 0.489  prec 0.721  FP/h   8.9  |  m =  3, N =  3: detected 2/2  FA/h 0.00  mean delay 5.8 s
+  window sens 0.459  prec 0.759  FP/h   6.8  |  m =  4, N =  3: detected 2/2  FA/h 0.00  mean delay 5.8 s
+  window sens 0.382  prec 0.808  FP/h   4.3  |  m =  6, N =  3: detected 2/2  FA/h 0.00  mean delay 6.2 s
+  window sens 0.332  prec 0.858  FP/h   2.6  |  m =  8, N =  3: detected 2/2  FA/h 0.00  mean delay 6.2 s
+  window sens 0.225  prec 0.901  FP/h   1.2  |  m = 12, N =  2: detected 2/2  FA/h 0.13  mean delay 6.8 s
+  window sens 0.115  prec 0.875  FP/h   0.8  |  m = 16, N =  2: detected 2/2  FA/h 0.00  mean delay 6.8 s
+  window sens 0.030  prec 1.000  FP/h   0.0  |  m = 24, N =  1: detected 2/2  FA/h 0.00  mean delay 7.2 s
+  window sens 0.008  prec 1.000  FP/h   0.0  |  m = 32, N =  1: detected 2/2  FA/h 0.00  mean delay 9.0 s
+  spec choice: m =  0, N =  4: detected 2/2  FA/h 0.00  mean delay 6.0 s
+  best choice: m =  1, N =  3: detected 2/2  FA/h 0.13  mean delay 5.5 s
+updated /content/drive/MyDrive/ECE662/662 Neuromorph/alif-training/runs/chb01_alif_s0/results.json and wrote val_outputs.npz
