@@ -115,6 +115,14 @@ def run_int_reference(spikes, weights, cfg=CONFIG):
 REFERENCE_FUNCS = [weight_shapes, lif_step_int, run_int_reference]
 
 
+def hardware_cost(cfg=CONFIG):
+    """Static hardware cost: weights, membranes, history buffer, worst-case adds per step.
+    Worst case assumes the delta encoder's at most one spike (UP or DOWN) per channel per step."""
+    nh, no = cfg["n_hidden"], cfg["n_outputs"]
+    return {"weights": cfg["n_inputs"] * nh + nh * no, "membranes": nh + no, "history_frames": 1,
+            "worst_adds_per_step": cfg["n_channels"] * nh + nh * no}
+
+
 # ---------------------------------------------------------------------------
 # Handoff: test cases and spec text (used by export.py)
 # ---------------------------------------------------------------------------
@@ -293,6 +301,18 @@ if torch is not None:
                 counts = counts + s2
                 hidden = hidden + s1.mean()
             return counts, hidden / T
+
+        @torch.no_grad()
+        def cost_stats(self, x, qat=False):
+            """Measured activity on a batch: spike rates and mean adds per step (event-driven).
+            Sums over the batch, for averaging (same keys as scnn.SCNNNet.cost_stats)."""
+            B, T = x.shape[:2]
+            nh, no = self.cfg["n_hidden"], self.cfg["n_outputs"]
+            counts, hidden = self(x, qat)
+            stats = {"rate_l1": float(hidden), "rate_out": float(counts.sum()) / (B * T * no),
+                     "adds_l1": float(x.sum()) / (B * T) * nh, "adds_l2": float(hidden) * nh * no}
+            stats["adds_per_step"] = stats["adds_l1"] + stats["adds_l2"]
+            return {k: v * B for k, v in stats.items()}
 
         def clamp_weights(self):
             """Keep float weights in [-2, 127/64] so round(64 w) fits int8. Call after every step."""
