@@ -35,21 +35,16 @@ positive windows) runs after this block, exactly as for a single model in train.
 
 Fixed rules first. The same registers also express the classic fixed (untrained) rules, named in
 fixed_rules(): pooled counts, and "k of M" votes (any, majority, unanimous). Literature basis:
-  - Ghawaly et al., “Exploring Spiking Neural Networks for Binary Classification in Multivariate 
-    Time Series at the Edge”, 2025 International Joint Conference on Neural Networks (IJCNN), 
-    23 Oct 2025 (doi:10.1109/IJCNN64981.2025.11228041, arXiv:2510.20997): 
+  - Ghawaly et al., "Exploring Spiking Neural Networks for Binary Classification in Multivariate
+    Time Series at the Edge", 2025 International Joint Conference on Neural Networks (IJCNN),
+    23 Oct 2025 (doi:10.1109/IJCNN64981.2025.11228041, arXiv:2510.20997):
     SNN ensembles on CHB-MIT with an FPGA deployment:
     a 3-member majority vote clearly beat single networks on EEG, while any-vote degraded it.
     They used fixed votes for interpretability, low cost and serial/parallel member execution.
-  - R.P.W. Duin, “The Combining Classifier: to Train or Not to Train?”, ICPR 2002): 
-    Classifier-fusion survey found that fixed rules are suboptimal when members differ in
-    reliability, but with little data a plain majority vote is often competitive with trained
-    combiners, which overfit. Each patient here has ~2 validation seizures, so the fixed rules
-    are the default and weights must earn their place.
-  - Classifier-fusion surveys (Duin 2002; Kuncheva 2014): fixed rules are suboptimal when
-    members differ in reliability, but with little data a plain majority vote is often
-    competitive with trained combiners, which overfit. Each patient here has ~2 validation
-    seizures, so the fixed rules are the default and weights must earn their place.
+  - R.P.W. Duin, "The Combining Classifier: to Train or Not to Train?", ICPR 2002:
+    Duin argues fixed rules are suboptimal when members differ in reliability; with little data,
+    plain majority voting is often recommended over trained combiners. Each patient here has ~2
+    validation seizures, so the fixed rules are the default and weights must earn their place.
   - Learned weights, when used, come from a logistic regression on the members' outputs, rounded
     to powers of two by params_from_linear() so they run on the same block. This follows the
     best-performing aggregation in Borovac et al., "Ensemble Learning Using Individual Neonatal
