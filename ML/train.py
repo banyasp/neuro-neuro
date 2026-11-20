@@ -6,6 +6,8 @@ Train one model for one patient: float training, QAT fine-tuning, int8 weights, 
     python train.py --patient chb01 ... --resume   # continue after a disconnect (same arguments)
     python train.py --patient chb01 ... --rescore  # redo the val alarm / margin report from saved weights
     python train.py --patient chb01 ... --test     # ONCE, at the very end: score the saved weights on test
+    python train.py --patient chb01 --model scnn --set kernel_len=32 dilations=1 group_filters=8   # ablation
+    python train.py --patient chb01 --model scnn --float-only   # spiking but float: skip QAT / int8
 
 Stages
   1. Float mode until validation stops improving (early stopping keeps the best epoch).
@@ -15,6 +17,10 @@ Stages
   must agree 100% with the QAT forward pass, or the script fails (op-order or saturation bug).
   Software-only models (no run_int_reference, e.g. --model cnn) run stage 1 only and skip the
   int8 / agreement / handoff steps; their outputs are logits instead of spike counts.
+  --float-only does the same for a hardware model (ablation: what does int8 cost?).
+  --set KEY=VALUE changes any of the model's own CONFIG entries (not the shared input spec).
+  Like --hidden, every non-default value is added to the run folder name, so pass the same
+  --set / --hidden / --float-only again for --resume / --rescore / --test.
 
 Metrics use the hardware decision rule (count1 > count0, tie = no seizure). There is no
 probability threshold to tune, because hardware can't apply one. The one exception is the
@@ -26,10 +32,11 @@ as in [Mehrabi 2026]) rather than inverse-frequency: on top of 1:4 sampling, ful
 would train for a 50/50 prior and inflate false alarms at the real ~1:300.
 Early stopping uses window-level F1 on validation (accuracy is meaningless at ~1:300).
 
-Outputs in <out>/<patient>_<model>_s<seed>/:
+Outputs in <out>/<patient>_<model>_s<seed>[_w<window>][_h<hidden>][_<key><value>...][_float]/:
   last.pt            checkpoint, rewritten every epoch (for --resume)
   weights_int8.npz   int8 weights, {"l1": [N_IN, H], "l2": [H, 2]}  (software-only models: weights.pt)
-  results.json       patient, seed, split, val metrics, alarm sweep, margin sweep, agreement, densities
+  results.json       patient, seed, split, config, val metrics, alarm sweep, margin sweep, agreement,
+                     densities, cost (weights, worst-case and measured adds per step, if the model has them)
   val_outputs.npz    per-window val outputs (counts, labels, recording, start), for the voter
   handoff/           golden vectors from real val windows in the export.py format:
                      "." decides seizure, background/ doesn't. Check with handoff/reference_<model>.py
@@ -50,7 +57,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 import export
-from common import FS, STEP, WINDOW
+from common import COMMON_CONFIG, FS, STEP, WINDOW
 from data.dataset import CACHE_DIR, WindowDataset, balanced_indices, load_recordings
 
 ALARM_NS = range(1, 11)      # persistence rule sweep: alarm after N consecutive positive windows
@@ -67,10 +74,15 @@ SZ_MAX_EVENT_S = 300               # split events longer than this
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--patient", required=True, help="e.g. chb01")
-    p.add_argument("--model", default="lif", help="module name: lif, alif, or cnn (software-only baseline)")
+    p.add_argument("--model", default="lif",
+                   help="module name: lif, alif, scnn, or a software-only model (cnn, scnn_float)")
     p.add_argument("--window", type=float, default=WINDOW / FS, help="window length in seconds (step = half)")
     p.add_argument("--hidden", type=int, help="hidden neurons for lif / alif (default: the model's CONFIG, 64). "
                                               "Pass the same value again for --resume / --rescore / --test")
+    p.add_argument("--set", nargs="+", default=[], metavar="KEY=VALUE",
+                   help="override the model's CONFIG, e.g. kernel_len=32 dilations=1,3 share_filters=false")
+    p.add_argument("--float-only", action="store_true",
+                   help="hardware model trained and scored in float mode only (no QAT, int8 or handoff)")
     p.add_argument("--epochs", type=int, default=200, help="max stage-1 epochs (early stopping usually ends sooner)")
     p.add_argument("--qat-epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=2e-3)
@@ -91,6 +103,7 @@ def parse_args():
     p.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "runs")
     p.add_argument("--verify-n", type=int, default=2000, help="windows checked against run_int_reference (0 = all)")
     p.add_argument("--resume", action="store_true", help="continue from <run>/last.pt")
+    p.add_argument("--skip-done", action="store_true", help="do nothing if this run already has results.json")
     p.add_argument("--rescore", action="store_true",
                    help="redo the validation alarm / margin report from saved weights (no training)")
     p.add_argument("--test", action="store_true", help="evaluate saved weights on the test split (once)")
@@ -110,6 +123,34 @@ def seed_everything(seed):
 def is_hardware(model_mod):
     """Hardware models have an integer reference; software-only ones (cnn) don't."""
     return hasattr(model_mod, "run_int_reference")
+
+
+def parse_value(text, current):
+    """A --set value, in the type of the CONFIG entry it replaces ("1,3" for a list)."""
+    if isinstance(current, bool):
+        if text.lower() not in ("true", "false", "1", "0"):
+            raise SystemExit(f"--set: expected true / false, got '{text}'")
+        return text.lower() in ("true", "1")
+    if isinstance(current, (list, tuple)):
+        return [parse_value(t, current[0]) for t in text.split(",")]
+    return type(current)(text)
+
+
+def apply_overrides(config, items, model_name):
+    """Apply --set KEY=VALUE items to the model's CONFIG in place. Returns the run-folder tag."""
+    tag = ""
+    for item in sorted(items):
+        key, eq, text = item.partition("=")
+        if not eq or key not in config:
+            options = ", ".join(k for k in config if k not in COMMON_CONFIG)
+            raise SystemExit(f"--set {item}: not a {model_name} CONFIG entry (options: {options})")
+        if key in COMMON_CONFIG:
+            raise SystemExit(f"--set {key}: part of the shared input spec; change common.py instead")
+        value = parse_value(text, config[key])
+        if value != config[key]:
+            tag += f"_{key}" + ("-".join(map(str, value)) if isinstance(value, list) else str(value))
+        config[key] = value
+    return tag
 
 
 def clone_state(model):
@@ -498,22 +539,40 @@ def alarm_report(ds, counts, hours):
             "best_alarm": {"margin": best["margin"], "n_consec": best["n_consec"]}}
 
 
+@torch.no_grad()
+def measure_cost(model_mod, model, ds, qat, device, n=4096, batch=512):
+    """Hardware cost: the module's static numbers (weights, worst-case adds per step) plus the
+    model's measured spike rates and mean adds per step on up to n random validation windows
+    (natural prevalence, so mostly background, like the hardware sees). None if the model has neither."""
+    cost = dict(model_mod.hardware_cost(model_mod.CONFIG)) if hasattr(model_mod, "hardware_cost") else {}
+    if hasattr(model, "cost_stats") and len(ds):
+        model.eval()
+        idx = np.random.default_rng(0).permutation(len(ds))[:n]
+        totals, seen = {}, 0
+        for x, _ in DataLoader(Subset(ds, idx), batch_size=batch):
+            for k, v in model.cost_stats(x.to(device), qat).items():
+                totals[k] = None if v is None else totals.get(k, 0.0) + v
+            seen += len(x)
+        cost.update({k: None if v is None else v / seen for k, v in totals.items()})
+    return cost or None
+
+
 def save_val_outputs(run_dir, ds, counts):
     """Per-window validation outputs (for the voter simulation and rescoring without the model)."""
     np.savez(run_dir / "val_outputs.npz", counts=counts, labels=ds.labels,
              recording=ds.recording, start=ds.start)
 
 
-def load_trained(model_mod, run_dir, device):
+def load_trained(model_mod, run_dir, device, hw):
     """The model from a finished run's saved weights (int8 for hardware models)."""
     model = model_mod.Net().to(device)
-    if is_hardware(model_mod):
+    if hw:
         weights = dict(np.load(run_dir / "weights_int8.npz"))
         expected = model_mod.weight_shapes()
         saved = {k: w.shape for k, w in weights.items()}
         if saved != expected:
             raise SystemExit(f"saved weights {saved} don't match the model {expected}: "
-                             "pass the same --hidden as when this run was trained")
+                             "pass the same --hidden / --set as when this run was trained")
         model.load_int_weights(weights)
     else:
         weights = None
@@ -521,14 +580,14 @@ def load_trained(model_mod, run_dir, device):
     return model, weights
 
 
-def rescore(model_mod, run_dir, recordings, window, step, device):
+def rescore(model_mod, run_dir, recordings, window, step, device, hw):
     """Redo the validation alarm/margin report from saved weights, without retraining
     (e.g. for runs made before the margin sweep existed). Updates results.json in place."""
     path = run_dir / "results.json"
     results = json.loads(path.read_text())
-    model, _ = load_trained(model_mod, run_dir, device)
+    model, _ = load_trained(model_mod, run_dir, device, hw)
     ds = WindowDataset(recordings, "val", window, step)
-    counts, _, _ = predict(model, ds, is_hardware(model_mod), device)
+    counts, _, _ = predict(model, ds, hw, device)
     results.pop("val_by_margin", None)          # replaced by margin_sweep
     results["config"] = getattr(model_mod, "CONFIG", None)
     results.update(alarm_report(ds, counts, split_hours(recordings, "val")))
@@ -537,7 +596,7 @@ def rescore(model_mod, run_dir, recordings, window, step, device):
     print(f"updated {path} and wrote val_outputs.npz")
 
 
-def run_test(args, model_mod, run_dir, recordings, window, step, device):
+def run_test(args, model_mod, run_dir, recordings, window, step, device, hw):
     """Score the saved int8 weights on the test split. Meant to run once, at the end."""
     out = run_dir / "test_results.json"
     if out.exists() and not args.force:
@@ -545,8 +604,7 @@ def run_test(args, model_mod, run_dir, recordings, window, step, device):
     results = json.loads((run_dir / "results.json").read_text())
     if "best_alarm" not in results:
         raise SystemExit("results.json predates the margin sweep: run with --rescore first")
-    hw = is_hardware(model_mod)
-    model, weights = load_trained(model_mod, run_dir, device)
+    model, weights = load_trained(model_mod, run_dir, device, hw)
     ds = WindowDataset(recordings, "test", window, step)
     hours = split_hours(recordings, "test")
     counts, hidden, inputs = predict(model, ds, hw, device)
@@ -583,8 +641,11 @@ def main():
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_mod = importlib.import_module(args.model)
-    hw = is_hardware(model_mod)
+    if args.float_only and not is_hardware(model_mod):
+        raise SystemExit(f"--float-only: '{args.model}' is already software-only")
+    hw = is_hardware(model_mod) and not args.float_only
     config = getattr(model_mod, "CONFIG", {})
+    set_tag = apply_overrides(config, args.set, args.model)   # edits the module's CONFIG, like --hidden
     hidden_tag = ""
     if args.hidden is not None:
         if "n_hidden" not in config:
@@ -599,19 +660,23 @@ def main():
     step = window // 2
     if (window, step) != (WINDOW, STEP):
         print(f"NOTE: window {window} / step {step} differs from the hardware spec ({WINDOW} / {STEP})")
-    tag = f"{args.patient}_{args.model}_s{args.seed}" + ("" if window == WINDOW else f"_w{window}") + hidden_tag
+    tag = (f"{args.patient}_{args.model}_s{args.seed}" + ("" if window == WINDOW else f"_w{window}") + hidden_tag
+           + set_tag + ("_float" if args.float_only else ""))
     run_dir = args.out / tag
     if (args.rescore or args.test) and not (run_dir / "results.json").exists():
-        raise SystemExit(f"no finished run at {run_dir} (same --seed / --window / --hidden as training?)")
+        raise SystemExit(f"no finished run at {run_dir} (same --seed / --window / --hidden / --set as training?)")
+    if args.skip_done and not (args.rescore or args.test) and (run_dir / "results.json").exists():
+        print(f"{run_dir} is already done, skipping")
+        return
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"device {device}, run dir {run_dir}" + (f", n_hidden {config['n_hidden']}" if "n_hidden" in config else ""))
 
     recordings = load_recordings([args.patient], args.cache)
     if args.test:
-        run_test(args, model_mod, run_dir, recordings, window, step, device)
+        run_test(args, model_mod, run_dir, recordings, window, step, device, hw)
         return
     if args.rescore:
-        rescore(model_mod, run_dir, recordings, window, step, device)
+        rescore(model_mod, run_dir, recordings, window, step, device, hw)
         return
 
     splits = split_info(recordings, window, step)
@@ -634,6 +699,10 @@ def main():
     print(f"\nfinal {'int8' if hw else 'float'} model, val: {fmt(final)}")
     report = alarm_report(ds_val, counts, val_hours)
     save_val_outputs(run_dir, ds_val, counts)
+    cost = measure_cost(model_mod, model, ds_val, hw, device)
+    if cost and cost.get("adds_per_step") is not None:
+        print(f"cost: {cost.get('weights')} weights, {cost.get('worst_adds_per_step')} worst-case adds/step, "
+              f"{cost['adds_per_step']:.0f} measured adds/step on validation")
 
     if hw:
         weights = model.quantize()
@@ -650,7 +719,7 @@ def main():
         torch.save(model.state_dict(), weights_path)
     results = {"patient": args.patient, "model": args.model, "seed": args.seed, "window": window, "step": step,
                "config": getattr(model_mod, "CONFIG", None), "args": vars(args), "split": splits, "val": final, **report, "agreement": agreement,
-               "density": {"input": final["input_rate"], "hidden": final["hidden_rate"]},
+               "density": {"input": final["input_rate"], "hidden": final["hidden_rate"]}, "cost": cost,
                "summaries": summaries, "history": history}
     (run_dir / "results.json").write_text(to_json(results))
     print(f"wrote {weights_path} and results.json")

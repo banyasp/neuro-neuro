@@ -7,9 +7,16 @@ Models, integer references, and the hardware handoff for the neuromorphic seizur
 | `common.py` | Spec shared by every model: `CHANNELS`, `N_IN`, `FS`, window size, input encoding, int8/int16 ranges, `spike_fn` surrogate for training |
 | `lif.py` | Model A: LIF SNN N_IN -> 64 -> 2 (integer reference + float training model) |
 | `alif.py` | Model B: adaptive-threshold (ALIF) SNN N_IN -> 64 -> 2. Same inputs, outputs and decision as `lif`; hidden neurons add an adaptation register. Reuses `lif.py`'s output layer and `LIFNet` weight handling |
+| `scnn.py` | Model C: spiking convolutional NN. Temporal filters shared by every channel (K = 16 taps, dilations 1 and 3), depthwise spatial layer, 2 output neurons; 656 weights. The convolution is delayed synapses, so it's the same LIF math with a spike-history buffer. Every config knob (`kernel_len`, `dilations`, `group_filters`, `depth_mult`, `readout`, `share_filters`) works through `train.py --set` |
+| `scnn_float.py` | Ablation: `scnn`'s architecture with ReLUs instead of spikes. Software only |
 | `cnn.py` | Baseline: small 1D CNN on the same spike windows, logits instead of spike counts. Software only (never exported) |
-| `train.py` | Per-patient training: float -> QAT -> int8, agreement check vs the integer reference, real-window handoff. `python train.py --patient chb01` (`--help` for options) |
-| `export.py` | Writes `handoff/<model>/` for any hardware model: `python export.py lif alif` |
+| `train.py` | Per-patient training: float -> QAT -> int8, agreement check vs the integer reference, real-window handoff. `python train.py --patient chb01` (`--help` for options). `--set KEY=VALUE` overrides the model's CONFIG, `--float-only` skips QAT / int8 for a hardware model; both are added to the run folder name |
+| `inspect_alarms.py` | Lists a finished run's validation alarms (detection vs false alarm); `--plot` saves a PNG per false alarm |
+| `summarize.py` | One table of every run in `--out` (validation, test if run, cost columns), mean +- std per model / variant; `--csv`, `--md` |
+| `ablate.py` | Runs the Model C ablations (plus `lif` / `alif` for comparison) through `train.py`; resumable. `--dry-run` prints the commands |
+| `diversity.py` | Pairwise disagreement / error correlation / false-positive overlap between runs, and which seizures only one model catches (input to the voter) |
+| `test_scnn.py` | Model C tests: causality, tap mapping, integer reference == QAT forward on every layer, export round-trip, on every config variant |
+| `export.py` | Writes `handoff/<model>/` for any hardware model: `python export.py lif alif scnn` |
 | `data/` | CHB-MIT pipeline: `preprocess.py` (EDF -> spike cache), `dataset.py` (windows, labels, split). See `data/CLAUDE.md` |
 | `handoff/` | What the hardware team gets. Generated; don't edit by hand |
 
@@ -42,6 +49,9 @@ Rules:
   `forward(x, qat=False) -> (output spike counts [B, n_out], mean hidden spike rate)`, where
   `qat=True` computes exactly what `run_int_reference` does; `clamp_weights()`; `quantize()` ->
   `{name: int8 array}`; and `load_int_weights(weights)`. See `LIFNet` in `lif.py`.
+- Optional, for the cost columns in `results.json` / `summarize.py`: a module-level `hardware_cost(cfg)`
+  (weights, membranes, history frames, worst-case adds per step) and `Net.cost_stats(x, qat)` (measured
+  spike rates and adds per step, summed over the batch). See `lif.py` and `scnn.py`.
 - Software-only models (e.g. `cnn.py`) don't need any of this; they never get exported. They only need
   `CONFIG` and `Net` with the same `forward(x, qat=False) -> (logits [B, n_out], activity)` signature.
   `train.py` sees there's no `run_int_reference` and runs float training only (no QAT, int8, agreement

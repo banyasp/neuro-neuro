@@ -34,6 +34,7 @@ Decision: seizure if output neuron 1 spikes more times than neuron 0 (tie = no s
 import numpy as np
 
 from common import COMMON_CONFIG, N_IN, T, W_MIN, W_MAX, V_MIN, V_MAX, random_spikes, random_int8
+import lif
 from lif import lif_step_int, random_weights
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,11 @@ def run_int_reference(spikes, weights, cfg=CONFIG):
 
 # Functions copied into the standalone handoff/<model>/reference_<model>.py
 REFERENCE_FUNCS = [weight_shapes, alif_step_int, lif_step_int, run_int_reference]
+
+
+def hardware_cost(cfg=CONFIG):
+    """Same as lif.hardware_cost, plus one adaptation register per hidden neuron."""
+    return {**lif.hardware_cost(cfg), "adapt_registers": cfg["n_hidden"]}
 
 
 # ---------------------------------------------------------------------------
