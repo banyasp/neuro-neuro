@@ -54,7 +54,7 @@ from common import COMMON_CONFIG, T, V_MAX
 # 1. Config (the spec)
 # ---------------------------------------------------------------------------
 
-MEMBERS = ["lif", "alif", "scnn"]   # member module names; "scnn" = the spiking CNN (rename to match)
+MEMBERS = ["lif", "alif", "scnn"]   # member module names: models A, B, C (lif.py, alif.py, scnn.py)
 MODES = {"count": 0, "vote": 1}     # value of the mode register
 
 
