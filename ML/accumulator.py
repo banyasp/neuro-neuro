@@ -32,6 +32,16 @@ seizure) applied to the pooled counts (mode 0), or a strict majority vote (mode 
 members, seizure if >= 2 members decide seizure). Shifts weight members by powers of two
 (the proposal's confidence-weighted voter). The persistence rule (alarm after N consecutive
 positive windows) runs after this block, exactly as for a single model in train.py.
+
+Fixed rules first. The same registers also express the classic fixed (untrained) rules, named in
+fixed_rules(): pooled counts, and "k of M" votes (any, majority, unanimous). Literature basis:
+  - Ghawaly et al. 2025 (arXiv:2510.20997), SNN ensembles on CHB-MIT with an FPGA deployment:
+    a 3-member majority vote clearly beat single networks on EEG, while any-vote degraded it.
+    They used fixed votes for interpretability, low cost and serial/parallel member execution.
+  - Classifier-fusion surveys (Duin 2002; Kuncheva 2014): fixed rules are suboptimal when
+    members differ in reliability, but with little data a plain majority vote is often
+    competitive with trained combiners, which overfit. Each patient here has ~2 validation
+    seizures, so the fixed rules are the default and weights must earn their place.
 """
 
 import itertools
@@ -202,6 +212,44 @@ def make_params(shifts, margin=0, mode="count"):
             "mode": np.array([[MODES[mode]]], dtype=np.int8)}
 
 
+def vote_margin(k, n_members):
+    """Margin that turns vote mode (all shifts 0) into "seizure if at least k members say so".
+
+    With equal shifts, A1 = votes for seizure and A0 = n_members - A1, so
+    A1 - A0 > margin  <=>  2 * A1 - n_members > margin. Choosing margin = 2k - n_members - 1
+    makes that true exactly when A1 >= k.
+
+    Args:
+        k: Votes needed, 1 <= k <= n_members.
+        n_members: Number of members.
+
+    Returns:
+        The int margin.
+    """
+    assert 1 <= k <= n_members
+    return 2 * k - n_members - 1
+
+
+def fixed_rules(n_members):
+    """The untrained combination rules, as parameter dicts (all shifts 0).
+
+    Args:
+        n_members: Number of members.
+
+    Returns:
+        Ordered {name: params}: "pooled" (members' rule on summed spike counts), then the k-of-M
+        votes "any" (k = 1), "majority" (k = n_members // 2 + 1) and "unanimous" (k = n_members).
+        Names that would repeat a rule (e.g. majority = unanimous for 2 members) are skipped.
+    """
+    zeros = [0] * n_members
+    rules, ks = {"pooled": make_params(zeros, 0, "count")}, set()
+    for name, k in (("any", 1), ("majority", n_members // 2 + 1), ("unanimous", n_members)):
+        if k not in ks:
+            ks.add(k)
+            rules[name] = make_params(zeros, vote_margin(k, n_members), "vote")
+    return rules
+
+
 def shift_grid(n_members, max_shift):
     """Every shift vector with min 0. Adding 1 to every shift only doubles both tallies, so
     vectors with min > 0 repeat a min-0 vector at a doubled margin."""
@@ -226,6 +274,17 @@ def test_cases(rng, cfg=CONFIG):
     """
     assert cfg["n_members"] == 3, "test cases are written for 3 members"
     cases = []
+
+    # The k-of-M rules, checked against plain vote counting on every pattern of member decisions
+    # (member says seizure: counts (0, 1); says non-seizure: counts (1, 0)).
+    for n in (2, 3, 4):
+        for k in range(1, n + 1):
+            p = make_params([0] * n, vote_margin(k, n), "vote")
+            for says in itertools.product((0, 1), repeat=n):
+                counts = np.array([[[1 - s, s] for s in says]])
+                assert decide_from_counts(counts, p)[1][0] == int(sum(says) >= k), f"{k}-of-{n} on {says}"
+    assert list(fixed_rules(3)) == ["pooled", "any", "majority", "unanimous"]
+    assert list(fixed_rules(2)) == ["pooled", "any", "majority"]   # 2-of-2 majority = unanimous
 
     def add(folder, desc, weights, spikes, expect=None):
         r = run_int_reference(spikes, weights, cfg)
