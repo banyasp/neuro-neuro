@@ -21,7 +21,7 @@ from common import FS
 
 COLUMNS = [   # (key, header, format)
     ("patient", "patient", "s"), ("model", "model", "s"), ("seed", "seed", "d"), ("window_s", "win s", ".1f"),
-    ("hidden", "hid n", "d"),
+    ("hidden", "hid n", "d"), ("variant", "variant", "s"),
     ("val_f1", "F1", ".3f"), ("val_sens", "sens", ".3f"), ("val_prec", "prec", ".3f"),
     ("val_fp_h", "FP/h", ".1f"),
     ("spec_n", "N", "d"), ("spec_detected", "det", "s"), ("spec_fa_h", "FA/h", ".2f"),
@@ -29,11 +29,12 @@ COLUMNS = [   # (key, header, format)
     ("best_m", "m*", "d"), ("best_n", "N*", "d"), ("best_detected", "det*", "s"), ("best_fa_h", "FA/h*", ".2f"),
     ("best_delay_s", "delay*", ".1f"),
     ("agree", "agree", ".3f"), ("input_rate", "in", ".3f"), ("hidden_rate", "hid", ".3f"),
+    ("weights", "wts", "d"), ("worst_adds", "worst", "d"), ("adds", "adds/step", ".0f"),
     ("test_detected", "test det", "s"), ("test_fa_h", "test FA/h", ".2f"), ("test_delay_s", "test delay", ".1f"),
     ("test_best_detected", "test det*", "s"), ("test_best_fa_h", "test FA/h*", ".2f"),
 ]
 MEAN_KEYS = ["val_f1", "val_sens", "val_prec", "val_fp_h", "spec_fa_h", "spec_delay_s", "best_fa_h",
-             "best_delay_s", "hidden_rate", "test_fa_h", "test_delay_s", "test_best_fa_h"]
+             "best_delay_s", "hidden_rate", "adds", "test_fa_h", "test_delay_s", "test_best_fa_h"]
 
 
 def find(sweep, n, m=0):
@@ -41,11 +42,20 @@ def find(sweep, n, m=0):
 
 
 def hidden_size(run, r):
-    """n_hidden from results.json, or (runs made before it was saved) from the int8 weights."""
-    n = (r.get("config") or {}).get("n_hidden")
-    if n is None and (run / "weights_int8.npz").exists():
+    """n_hidden from results.json, or (lif / alif runs made before the config was saved) from the
+    int8 weights. Models without n_hidden (scnn, cnn) give None."""
+    if r.get("config") is not None:
+        return r["config"].get("n_hidden")
+    n = None
+    if (run / "weights_int8.npz").exists():
         n = int(np.load(run / "weights_int8.npz")["l1"].shape[1])
     return n
+
+
+def variant(r):
+    """train.py --set / --float-only options of a run ("" = the model's default config)."""
+    a = r.get("args") or {}
+    return " ".join(sorted(a.get("set") or []) + (["float-only"] if a.get("float_only") else []))
 
 
 def row(run):
@@ -64,7 +74,10 @@ def row(run):
            "best_m": m, "best_n": n, "best_detected": f"{best['detected']}/{best['seizures']}",
            "best_fa_h": best["fa_per_hour"], "best_delay_s": best["mean_delay_s"],
            "agree": r["agreement"]["rate"] if r.get("agreement") else None,
-           "input_rate": r["density"]["input"], "hidden_rate": r["density"]["hidden"]}
+           "input_rate": r["density"]["input"], "hidden_rate": r["density"]["hidden"],
+           "variant": variant(r), "weights": (r.get("cost") or {}).get("weights"),
+           "worst_adds": (r.get("cost") or {}).get("worst_adds_per_step"),
+           "adds": (r.get("cost") or {}).get("adds_per_step")}
     t_path = run / "test_results.json"
     if t_path.exists():
         t = json.loads(t_path.read_text())
@@ -90,10 +103,17 @@ def print_table(rows, cols):
         print("  ".join(x.rjust(w) for x, w in zip(line, widths)))
 
 
+def markdown_table(rows, cols):
+    lines = ["| run | " + " | ".join(h for _, h, _ in cols) + " |", "|---" * (len(cols) + 1) + "|"]
+    lines += ["| " + r["run"] + " | " + " | ".join(cell(r.get(k), f) for k, _, f in cols) + " |" for r in rows]
+    return "\n".join(lines) + "\n"
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "runs")
     p.add_argument("--csv", type=Path, help="also write all rows to this CSV file")
+    p.add_argument("--md", type=Path, help="also write the per-run table as Markdown")
     args = p.parse_args()
 
     rows, stale = [], []
@@ -108,21 +128,22 @@ def main():
     # hide test columns until some run has them
     cols = [c for c in COLUMNS if not c[0].startswith("test") or any(r.get(c[0]) is not None for r in rows)]
     print("Per run (validation unless marked test). N / det / FA/h / delay = alarm at m = 0 (spec);")
-    print("starred = best (m, N) from the margin ablation. det = SzCORE events detected / total.\n")
+    print("starred = best (m, N) from the margin ablation. det = SzCORE events detected / total.")
+    print("wts / worst / adds/step = int8 weights, worst-case and measured (validation) adds per timestep.\n")
     print_table(rows, cols)
 
-    print("\nMean +- std across runs, per model, window and hidden size:")
+    print("\nMean +- std across runs, per model, window, hidden size and variant:")
     groups = defaultdict(list)
     for r in rows:
-        groups[(r["model"], r["window_s"], r["hidden"])].append(r)
-    for (model, win, hidden), rs in groups.items():
+        groups[(r["model"], r["window_s"], r["hidden"], r["variant"])].append(r)
+    for (model, win, hidden, var), rs in groups.items():
         parts = []
         for k in MEAN_KEYS:
             vals = [r[k] for r in rs if r.get(k) is not None]
             if vals:
                 parts.append(f"{k} {np.mean(vals):.3g}+-{np.std(vals):.2g}")
         patients = sorted({r["patient"] for r in rs})
-        size = f", {hidden} hidden" if hidden is not None else ""
+        size = (f", {hidden} hidden" if hidden is not None else "") + (f", {var}" if var else "")
         print(f"  {model} ({win:.1f} s windows{size}; {len(rs)} runs, {len(patients)} patients: {', '.join(patients)})")
         for i in range(0, len(parts), 4):
             print("    " + "   ".join(parts[i:i + 4]))
@@ -134,6 +155,9 @@ def main():
             w.writeheader()
             w.writerows(rows)
         print(f"\nwrote {args.csv}")
+    if args.md:
+        args.md.write_text(markdown_table(rows, cols))
+        print(f"wrote {args.md}")
 
 
 if __name__ == "__main__":
