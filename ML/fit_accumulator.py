@@ -18,8 +18,13 @@ Selection uses train.py's alarm scoring (persistence rule + SzCORE event rules) 
 train.choose_alarm. By default (--search fixed) it only chooses among the untrained rules in
 accumulator.fixed_rules() (pooled counts; any / majority / unanimous vote), each with its best N:
 with ~2 validation seizures per patient, fixed rules are the literature's safer choice (see the
-accumulator.py docstring). --search grid also sweeps every mode x shift vector x margin, which is
-many choices for a handful of seizures: compare it with the fixed rules before trusting it.
+accumulator.py docstring). Two opt-in searches for weighted settings:
+  --search grid      every mode x shift vector x margin (many choices for a handful of seizures)
+  --search logistic  one logistic regression per mode on the members' outputs (count differences
+                     or +-1 votes), rounded to shifts and a margin by accumulator.params_from_linear
+Either way the weighted result only replaces the best fixed rule if it is clearly better
+(clearly_better). Both are fitted on the same validation windows the members were early-stopped
+on, which flatters them; the gate is there for that reason.
 """
 
 import argparse
@@ -36,6 +41,7 @@ from data.dataset import CACHE_DIR, WindowDataset, load_recordings
 MARGINS = (-4, -2, -1, 0, 1, 2, 4, 8, 16, 32)   # accumulator margins tried (int8)
 TOP_K = 10                                       # settings listed in results.json
 MIN_FA_GAIN = 2                                  # false alarms a weighted setting must save (see clearly_better)
+L2 = 1e-3                                        # logistic regression ridge, on features scaled to [-1, 1]
 
 
 def parse_args():
@@ -48,12 +54,14 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0, help="seed of the member runs (and the output folder tag)")
     p.add_argument("--cache", type=Path, default=CACHE_DIR, help="preprocess.py output folder")
     p.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "runs")
-    p.add_argument("--search", choices=["fixed", "grid"], default="fixed",
-                   help="fixed: choose among the untrained rules only (default); grid: also sweep weights")
+    p.add_argument("--search", choices=["fixed", "grid", "logistic"], default="fixed",
+                   help="fixed: choose among the untrained rules only (default); grid / logistic: also try "
+                        "weighted settings (see above)")
     p.add_argument("--modes", nargs="+", default=list(acc.MODES), choices=list(acc.MODES),
-                   help="--search grid only")
-    p.add_argument("--max-shift", type=int, default=acc.CONFIG["max_shift"], help="--search grid only")
+                   help="--search grid / logistic")
+    p.add_argument("--max-shift", type=int, default=acc.CONFIG["max_shift"], help="--search grid / logistic")
     p.add_argument("--margins", nargs="+", type=int, default=MARGINS, help="--search grid only")
+    p.add_argument("--l2", type=float, default=L2, help="--search logistic: ridge penalty")
     p.add_argument("--test", action="store_true", help="apply the saved parameters to the test split (once)")
     p.add_argument("--min-fa-gain", type=int, default=MIN_FA_GAIN,
                    help="--search grid: weights must save at least this many false alarms (same detections) "
@@ -121,6 +129,44 @@ def fmt(a):
     delay = a["mean_delay_s"] if a["mean_delay_s"] is not None else float("nan")
     return (f"N = {a['n_consec']:2d}: detected {a['detected']}/{a['seizures']}  "
             f"FA/h {a['fa_per_hour'] or 0:.2f}  mean delay {delay:.1f} s")
+
+
+def fit_logistic(X, y, l2=L2, iters=100):
+    """Class-balanced, L2-regularised logistic regression by Newton's method (IRLS), NumPy only.
+
+    Seizure windows are rare, so each class gets half the total sample weight; otherwise the
+    fit would mostly learn "no seizure". Features are scaled to [-1, 1] for the fit (the penalty
+    and conditioning depend on scale) and the weights are returned in the original units.
+
+    Args:
+        X: Features [n_windows, n_members] (accumulator.features).
+        y: 0/1 labels [n_windows]; both classes must be present.
+        l2: Ridge penalty on the scaled weights (not on the intercept).
+        iters: Maximum Newton steps.
+
+    Returns:
+        (weights float [n_members], bias float): seizure if bias + X @ weights > 0.
+    """
+    X, y = np.asarray(X, dtype=float), np.asarray(y, dtype=float)
+    pos = y.mean()
+    if not 0 < pos < 1:
+        raise SystemExit("logistic fit needs both seizure and non-seizure windows")
+    scale = np.abs(X).max(axis=0)
+    scale[scale == 0] = 1
+    Z = np.hstack([X / scale, np.ones((len(X), 1))])
+    sw = np.where(y == 1, 0.5 / pos, 0.5 / (1 - pos)) / len(y)     # balanced, sums to 1
+    R = l2 * np.eye(Z.shape[1])
+    R[-1, -1] = 0
+    w = np.zeros(Z.shape[1])
+    for _ in range(iters):
+        p = 1 / (1 + np.exp(-np.clip(Z @ w, -30, 30)))
+        grad = Z.T @ (sw * (p - y)) + R @ w
+        hess = (Z * (sw * p * (1 - p))[:, None]).T @ Z + R
+        step = np.linalg.solve(hess, grad)
+        w -= step
+        if np.abs(step).max() < 1e-9:
+            break
+    return w[:-1] / scale, float(w[-1])
 
 
 def clearly_better(a, b, min_fa_gain=MIN_FA_GAIN):
@@ -209,32 +255,59 @@ def fit(args, dirs):
         baselines[label] = {**evaluate(params), "rule": label}
         print(f"  {label:28s} {fmt(baselines[label]['alarm'])}")
 
-    # Candidates: the fixed rules only (default), or the full mode x shift vector x margin grid
+    # Candidates: the fixed rules only (default), the full mode x shift vector x margin grid,
+    # or one rounded logistic regression per mode
+    logistic = {}
     if args.search == "fixed":
         rows = [baselines[label] for label in fixed]
         print(f"\nChoosing among the {len(rows)} fixed rules (target FA/h < {train.TARGET_FA_PER_HOUR})...")
-    else:
+    elif args.search == "grid":
         settings = [acc.make_params(s, m, mode) for mode in args.modes
                     for s in acc.shift_grid(M, args.max_shift) for m in args.margins]
         print(f"\nSweeping {len(settings)} settings x {len(train.ALARM_NS)} values of N "
               f"(target FA/h < {train.TARGET_FA_PER_HOUR})...")
         rows = [evaluate(p) for p in settings]
+    else:
+        print(f"\nLogistic regression per mode (l2 {args.l2}), rounded to shifts <= {args.max_shift}:")
+        rows = []
+        for mode in args.modes:
+            X = acc.features(member_counts, mode)
+            w, b = fit_logistic(X, labels, args.l2)
+            float_dec = (b + X @ w > 0).astype(np.int64)            # before rounding, for comparison
+            float_alarm = train.choose_alarm(sweep_setting(ds, float_dec, hours, cache))
+            params = acc.params_from_linear(w, b, mode, args.max_shift)
+            logistic[mode] = {"weights": w.tolist(), "bias": b, "float_alarm": float_alarm,
+                              "float_window": train.window_metrics(float_dec, labels, hours),
+                              "rounded": describe(params, args.members) if params is not None else None}
+            weights = ", ".join(f"{m} {x:+.3g}" for m, x in zip(args.members, w))
+            print(f"  {mode:5s} weights [{weights}], bias {b:+.3g}")
+            print(f"        float:   {fmt(float_alarm)}")
+            if params is None:
+                print("        no positive weight: the block cannot express this fit, skipped")
+                continue
+            rows.append(evaluate(params))
+            print(f"        rounded: {rows[-1]['setting']}  {fmt(rows[-1]['alarm'])}")
+
     def pick(candidates):
         """The row whose best alarm train.choose_alarm prefers."""
         chosen_alarm = train.choose_alarm([r["alarm"] for r in candidates])
         return next(r for r in candidates if r["alarm"] is chosen_alarm)
 
     best = best_fixed = pick([baselines[label] for label in fixed])
-    selection = {"best_fixed": best_fixed["rule"], "weights_accepted": False, "reason": "--search fixed"}
-    if args.search == "grid":
-        best_grid = pick(rows)
-        accepted, reason = clearly_better(best_grid["alarm"], best_fixed["alarm"], args.min_fa_gain)
+    selection = {"best_fixed": best_fixed["rule"], "weights_accepted": False, "reason": f"--search {args.search}"}
+    if args.search != "fixed" and not rows:
+        selection["reason"] = "no weighted setting could be expressed: keeping the best fixed rule"
+        print(f"  {selection['reason']}")
+    elif args.search != "fixed":
+        best_weighted = pick(rows)
+        accepted, reason = clearly_better(best_weighted["alarm"], best_fixed["alarm"], args.min_fa_gain)
         print(f"  best fixed rule: {best_fixed['rule']} = {best_fixed['setting']}  {fmt(best_fixed['alarm'])}")
-        print(f"  best of grid:    {best_grid['setting']}  {fmt(best_grid['alarm'])}")
-        print(f"  {'use' if accepted else 'keep the fixed rule, not'} the grid setting: {reason}")
-        selection = {**selection, "best_grid": best_grid["setting"], "weights_accepted": accepted, "reason": reason}
+        print(f"  best weighted:   {best_weighted['setting']}  {fmt(best_weighted['alarm'])}")
+        print(f"  {'use' if accepted else 'keep the fixed rule, not'} the weighted setting: {reason}")
+        selection = {**selection, "best_weighted": best_weighted["setting"], "weights_accepted": accepted,
+                     "reason": reason}
         if accepted:
-            best = best_grid
+            best = best_weighted
     ranked = sorted(rows, key=lambda r: rank_key(r["alarm"]))
     name = f"{best['rule']} = " if "rule" in best else ""
     print(f"  chosen: {name}{best['setting']}  {fmt(best['alarm'])}")
@@ -251,7 +324,8 @@ def fit(args, dirs):
                "seed": args.seed, "config": cfg, "args": vars(args), "val_hours": hours,
                "chosen": {**strip(best), "alarm_n": best["alarm"]["n_consec"]}, "selection": selection,
                "baselines": {k: strip(v) for k, v in baselines.items()},
-               "search": args.search, "top": [strip(r) for r in ranked[:TOP_K]], "n_settings": len(rows)}
+               "search": args.search, "logistic": logistic,
+               "top": [strip(r) for r in ranked[:TOP_K]], "n_settings": len(rows)}
     (run_dir / "results.json").write_text(train.to_json(results))
     print(f"wrote {run_dir / 'results.json'} and params_int8.npz")
 

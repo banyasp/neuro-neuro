@@ -46,6 +46,16 @@ fixed_rules(): pooled counts, and "k of M" votes (any, majority, unanimous). Lit
     reliability, but with little data a plain majority vote is often competitive with trained
     combiners, which overfit. Each patient here has ~2 validation seizures, so the fixed rules
     are the default and weights must earn their place.
+  - Classifier-fusion surveys (Duin 2002; Kuncheva 2014): fixed rules are suboptimal when
+    members differ in reliability, but with little data a plain majority vote is often
+    competitive with trained combiners, which overfit. Each patient here has ~2 validation
+    seizures, so the fixed rules are the default and weights must earn their place.
+  - Learned weights, when used, come from a logistic regression on the members' outputs, rounded
+    to powers of two by params_from_linear() so they run on the same block. This follows the
+    best-performing aggregation in Borovac et al., "Ensemble Learning Using Individual Neonatal
+    Data for Seizure Detection", IEEE J. Transl. Eng. Health Med., 18 Aug 2022
+    (doi:10.1109/JTEHM.2022.3201167, arXiv:2204.07043): a weighted mean whose weights come from a
+    logistic-regression stacking classifier, which beat the plain mean and majority vote.
 """
 
 import itertools
@@ -254,6 +264,52 @@ def fixed_rules(n_members):
     return rules
 
 
+def features(member_counts, mode):
+    """Per-member signed evidence for seizure, as the accumulator sums it (before the shifts).
+
+    With all shifts 0, A1 - A0 = sum_m features[m] in both modes, so a linear model on these
+    features is exactly what the accumulator can compute once its weights are powers of two.
+
+    Args:
+        member_counts: Int array [n_windows, n_members, 2] of (count0, count1) per member.
+        mode: "count" (feature = count1 - count0) or "vote" (feature = +1 if the member decides
+            seizure, i.e. count1 > count0, else -1).
+
+    Returns:
+        Int array [n_windows, n_members].
+    """
+    c = np.asarray(member_counts, dtype=np.int64)
+    diff = c[..., 1] - c[..., 0]
+    return diff if mode == "count" else np.where(diff > 0, 1, -1)
+
+
+def params_from_linear(weights, bias, mode, max_shift):
+    """Round a linear rule "seizure if bias + sum_m weights[m] * features[m] > 0" to accumulator
+    parameters (power-of-two weights and an integer margin).
+
+    The smallest representable weight is w_ref = max(smallest positive weight,
+    largest weight / 2**max_shift), so the largest weight fits in max_shift. Then
+    shift[m] = round(log2(weights[m] / w_ref)) clipped to [0, max_shift] (weights <= 0, which the
+    block cannot express, get shift 0), and margin = round(-bias / w_ref) clipped to int8.
+
+    Args:
+        weights: Real per-member weights, length n_members.
+        bias: Real intercept.
+        mode: "count" or "vote" (the feature definition the weights were fitted on).
+        max_shift: Largest allowed shift.
+
+    Returns:
+        Parameter dict (see make_params), or None if no weight is positive.
+    """
+    w = np.asarray(weights, dtype=float)
+    if not (w > 0).any():
+        return None
+    w_ref = max(w[w > 0].min(), w.max() / 2 ** max_shift)
+    shifts = [int(np.clip(np.round(np.log2(x / w_ref)), 0, max_shift)) if x > 0 else 0 for x in w]
+    margin = int(np.clip(np.round(-bias / w_ref), -128, 127))
+    return make_params(shifts, margin, mode)
+
+
 def shift_grid(n_members, max_shift):
     """Every shift vector with min 0. Adding 1 to every shift only doubles both tallies, so
     vectors with min > 0 repeat a min-0 vector at a doubled margin."""
@@ -289,6 +345,24 @@ def test_cases(rng, cfg=CONFIG):
                 assert decide_from_counts(counts, p)[1][0] == int(sum(says) >= k), f"{k}-of-{n} on {says}"
     assert list(fixed_rules(3)) == ["pooled", "any", "majority", "unanimous"]
     assert list(fixed_rules(2)) == ["pooled", "any", "majority"]   # 2-of-2 majority = unanimous
+
+    # Rounding linear rules to shifts, against values worked out by hand.
+    def rounded(w, b, mode="count", ms=3):
+        p = params_from_linear(w, b, mode, ms)
+        return p["shift"][:, 0].tolist(), int(p["margin"][0, 0]), int(p["mode"][0, 0])
+    assert rounded([1, 2, 4], -3) == ([0, 1, 2], 3, 0)           # exact powers of two, w_ref = 1
+    assert rounded([0.5, 0.5, 8], 0) == ([0, 0, 3], 0, 0)       # w_ref = 8 / 2**3 = 1: 0.5 -> 2^-1 -> clip 0
+    assert rounded([3, 6, 12], 1.4, "vote") == ([0, 1, 2], 0, 1)  # w_ref = 3; margin round(-1.4/3) = 0
+    assert rounded([2, -1, 2.9], -5) == ([0, 0, 1], 2, 0)       # negative -> 0; log2(1.45) = 0.54 -> 1; 5/2 -> 2
+    assert params_from_linear([-1, 0, -2], 0, "count", 3) is None
+    assert features(np.array([[[3, 5], [5, 3], [4, 4]]]), "count").tolist() == [[2, -2, 0]]
+    assert features(np.array([[[3, 5], [5, 3], [4, 4]]]), "vote").tolist() == [[1, -1, -1]]  # tie -> -1
+    # Exact powers of two + integer bias: the block must reproduce the linear rule on any counts.
+    counts = np.random.default_rng(662).integers(0, T + 1, size=(2000, 3, 2))   # own rng: cases below unchanged
+    for mode in MODES:
+        w, b = np.array([1, 4, 2]), -3
+        _, dec = decide_from_counts(counts, params_from_linear(w, b, mode, cfg["max_shift"]))
+        assert (dec == (b + features(counts, mode) @ w > 0)).all(), f"linear rule != block ({mode})"
 
     def add(folder, desc, weights, spikes, expect=None):
         r = run_int_reference(spikes, weights, cfg)
