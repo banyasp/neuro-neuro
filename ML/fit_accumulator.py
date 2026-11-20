@@ -35,6 +35,7 @@ from data.dataset import CACHE_DIR, WindowDataset, load_recordings
 
 MARGINS = (-4, -2, -1, 0, 1, 2, 4, 8, 16, 32)   # accumulator margins tried (int8)
 TOP_K = 10                                       # settings listed in results.json
+MIN_FA_GAIN = 2                                  # false alarms a weighted setting must save (see clearly_better)
 
 
 def parse_args():
@@ -54,6 +55,9 @@ def parse_args():
     p.add_argument("--max-shift", type=int, default=acc.CONFIG["max_shift"], help="--search grid only")
     p.add_argument("--margins", nargs="+", type=int, default=MARGINS, help="--search grid only")
     p.add_argument("--test", action="store_true", help="apply the saved parameters to the test split (once)")
+    p.add_argument("--min-fa-gain", type=int, default=MIN_FA_GAIN,
+                   help="--search grid: weights must save at least this many false alarms (same detections) "
+                        "to replace the best fixed rule")
     p.add_argument("--force", action="store_true", help="let --test run again")
     return p.parse_args()
 
@@ -117,6 +121,35 @@ def fmt(a):
     delay = a["mean_delay_s"] if a["mean_delay_s"] is not None else float("nan")
     return (f"N = {a['n_consec']:2d}: detected {a['detected']}/{a['seizures']}  "
             f"FA/h {a['fa_per_hour'] or 0:.2f}  mean delay {delay:.1f} s")
+
+
+def clearly_better(a, b, min_fa_gain=MIN_FA_GAIN):
+    """Whether alarm result `a` (a weighted setting) beats `b` (the best fixed rule) by enough
+    to justify its extra parameters, judged on validation counts rather than rates or delay.
+
+    Args:
+        a: Alarm metrics dict (train.alarm_metrics) of the candidate.
+        b: Alarm metrics dict of the incumbent.
+        min_fa_gain: False alarms `a` must save when both detect the same seizures.
+
+    Returns:
+        (bool, reason): True only if `a` detects more seizures; or detects as many with at least
+        `min_fa_gain` fewer false alarms; or meets the FA/h target when `b` does not, with no fewer
+        detections. A shorter delay alone never counts: with ~2 seizures it is mostly noise.
+    """
+    def under_target(x):
+        return x["fa_per_hour"] is not None and x["fa_per_hour"] < train.TARGET_FA_PER_HOUR
+
+    if a["detected"] > b["detected"]:
+        return True, f"detects {a['detected']} vs {b['detected']} seizures"
+    if a["detected"] < b["detected"]:
+        return False, f"detects fewer seizures ({a['detected']} vs {b['detected']})"
+    if under_target(a) and not under_target(b):
+        return True, f"meets the FA/h target ({a['fa_per_hour']:.2f} vs {b['fa_per_hour']:.2f})"
+    saved = b["false_alarms"] - a["false_alarms"]
+    if saved >= min_fa_gain:
+        return True, f"saves {saved} false alarms (>= {min_fa_gain})"
+    return False, f"saves {saved} false alarms (< {min_fa_gain}), same detections: not worth the weights"
 
 
 def rank_key(a):
@@ -186,8 +219,22 @@ def fit(args, dirs):
         print(f"\nSweeping {len(settings)} settings x {len(train.ALARM_NS)} values of N "
               f"(target FA/h < {train.TARGET_FA_PER_HOUR})...")
         rows = [evaluate(p) for p in settings]
-    best_alarm = train.choose_alarm([r["alarm"] for r in rows])
-    best = next(r for r in rows if r["alarm"] is best_alarm)
+    def pick(candidates):
+        """The row whose best alarm train.choose_alarm prefers."""
+        chosen_alarm = train.choose_alarm([r["alarm"] for r in candidates])
+        return next(r for r in candidates if r["alarm"] is chosen_alarm)
+
+    best = best_fixed = pick([baselines[label] for label in fixed])
+    selection = {"best_fixed": best_fixed["rule"], "weights_accepted": False, "reason": "--search fixed"}
+    if args.search == "grid":
+        best_grid = pick(rows)
+        accepted, reason = clearly_better(best_grid["alarm"], best_fixed["alarm"], args.min_fa_gain)
+        print(f"  best fixed rule: {best_fixed['rule']} = {best_fixed['setting']}  {fmt(best_fixed['alarm'])}")
+        print(f"  best of grid:    {best_grid['setting']}  {fmt(best_grid['alarm'])}")
+        print(f"  {'use' if accepted else 'keep the fixed rule, not'} the grid setting: {reason}")
+        selection = {**selection, "best_grid": best_grid["setting"], "weights_accepted": accepted, "reason": reason}
+        if accepted:
+            best = best_grid
     ranked = sorted(rows, key=lambda r: rank_key(r["alarm"]))
     name = f"{best['rule']} = " if "rule" in best else ""
     print(f"  chosen: {name}{best['setting']}  {fmt(best['alarm'])}")
@@ -202,7 +249,7 @@ def fit(args, dirs):
     strip = lambda r: {k: v for k, v in r.items() if k != "alarm_sweep"}
     results = {"patient": args.patient, "members": args.members, "member_runs": [str(d) for d in dirs],
                "seed": args.seed, "config": cfg, "args": vars(args), "val_hours": hours,
-               "chosen": {**strip(best), "alarm_n": best["alarm"]["n_consec"]},
+               "chosen": {**strip(best), "alarm_n": best["alarm"]["n_consec"]}, "selection": selection,
                "baselines": {k: strip(v) for k, v in baselines.items()},
                "search": args.search, "top": [strip(r) for r in ranked[:TOP_K]], "n_settings": len(rows)}
     (run_dir / "results.json").write_text(train.to_json(results))
