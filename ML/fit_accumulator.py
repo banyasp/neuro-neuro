@@ -25,17 +25,23 @@ accumulator.py docstring). Two opt-in searches for weighted settings:
 Either way the weighted result only replaces the best fixed rule if it is clearly better
 (clearly_better). Both are fitted on the same validation windows the members were early-stopped
 on, which flatters them; the gate is there for that reason.
+
+--cv checks the selection procedure itself: each validation recording is left out in turn, the
+whole procedure is re-run on the others, and its choice is scored on the left-out recording.
+The totals estimate how each procedure does on data it did not choose from, so you can see
+whether a weighted search generalises better than the fixed rules or only fits noise.
 """
 
 import argparse
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
 import accumulator as acc
 import train
-from common import STEP, WINDOW
+from common import FS, STEP, WINDOW
 from data.dataset import CACHE_DIR, WindowDataset, load_recordings
 
 MARGINS = (-4, -2, -1, 0, 1, 2, 4, 8, 16, 32)   # accumulator margins tried (int8)
@@ -62,6 +68,9 @@ def parse_args():
     p.add_argument("--max-shift", type=int, default=acc.CONFIG["max_shift"], help="--search grid / logistic")
     p.add_argument("--margins", nargs="+", type=int, default=MARGINS, help="--search grid only")
     p.add_argument("--l2", type=float, default=L2, help="--search logistic: ridge penalty")
+    p.add_argument("--cv", action="store_true",
+                   help="also leave each validation recording out in turn: re-run the selection without it "
+                        "and score the result on it (for --search fixed and the chosen --search)")
     p.add_argument("--test", action="store_true", help="apply the saved parameters to the test split (once)")
     p.add_argument("--min-fa-gain", type=int, default=MIN_FA_GAIN,
                    help="--search grid: weights must save at least this many false alarms (same detections) "
@@ -219,59 +228,90 @@ def sweep_setting(ds, decisions, hours, cache):
     return cache[key]
 
 
-def fit(args, dirs):
-    member_counts, labels, recording, start = load_member_outputs(dirs, "val")
-    recordings = load_recordings([args.patient], args.cache)
-    ds = dataset_for(recordings, "val", recording, start)
-    hours = train.split_hours(recordings, "val")
-    cfg = acc.make_config(args.members, args.max_shift)
-    M = cfg["n_members"]
-    print(f"{args.patient} validation: {len(labels)} windows ({int(labels.sum())} seizure), {hours:.1f} h, "
-          f"members {', '.join(args.members)}")
+def subset(data, mask):
+    """The windows where mask is True, as a self-contained data bundle (same fields as `data`).
 
+    The dataset view keeps only what train.alarm_metrics reads (rec, start, recordings, window),
+    and hours count only the recordings that still have windows.
+    """
+    rec = data.ds.rec[mask]
+    view = SimpleNamespace(rec=rec, start=data.ds.start[mask], recordings=data.ds.recordings, window=data.ds.window)
+    hours = sum(len(data.ds.recordings[r]["seizure_mask"]) for r in np.unique(rec)) / FS / 3600
+    return SimpleNamespace(member_counts=data.member_counts[mask], labels=data.labels[mask], ds=view, hours=hours)
+
+
+def select(data, args, search, verbose=True):
+    """The selection procedure: baselines, candidates for `search`, then the clearly_better gate.
+
+    Factored out of fit() so the identical procedure can be re-run on part of the validation
+    windows (leave_one_recording_out).
+
+    Args:
+        data: Bundle with member_counts, labels, ds (dataset or subset view) and hours.
+        args: Parsed arguments (members, modes, max_shift, margins, l2, min_fa_gain).
+        search: "fixed", "grid" or "logistic".
+        verbose: Print the tables (False inside the cross-validation).
+
+    Returns:
+        Dict with "best" (the chosen row: setting, mode, shift, margin, window and alarm metrics,
+        including its N), "baselines", "rows" (all candidates of `search`), "selection" (gate
+        outcome), "logistic" (fits, if any) and "n_decisions" (distinct decision vectors scored).
+    """
+    log = print if verbose else (lambda *a, **k: None)
+    M = len(args.members)
+    cfg = acc.make_config(args.members, args.max_shift)
+    counts, labels, ds, hours = data.member_counts, data.labels, data.ds, data.hours
     cache = {}
 
     def evaluate(params):
         """Window metrics plus the best N for one parameter setting."""
         acc.check_params(params, cfg)
-        _, dec = acc.decide_from_counts(member_counts, params)
+        _, dec = acc.decide_from_counts(counts, params)
         alarms = [{**a, "margin": int(params["margin"][0, 0])} for a in sweep_setting(ds, dec, hours, cache)]
-        best = train.choose_alarm(alarms)
         return {"setting": describe(params, args.members),
                 "mode": int(params["mode"][0, 0]), "shift": params["shift"][:, 0].tolist(),
                 "margin": int(params["margin"][0, 0]),
-                "window": train.window_metrics(dec, labels, hours), "alarm": best, "alarm_sweep": alarms}
+                "window": train.window_metrics(dec, labels, hours), "alarm": train.choose_alarm(alarms),
+                "alarm_sweep": alarms}
+
+    def pick(candidates):
+        """The row whose best alarm train.choose_alarm prefers."""
+        chosen_alarm = train.choose_alarm([r["alarm"] for r in candidates])
+        return next(r for r in candidates if r["alarm"] is chosen_alarm)
 
     # Baselines: every member alone (its own spec rule), then every fixed (untrained) rule
-    print("\nBaselines (each member alone at margin 0, then the fixed rules):")
+    log("\nBaselines (each member alone at margin 0, then the fixed rules):")
     baselines = {}
     for m, name in enumerate(args.members):
-        dec = train.decide(member_counts[:, m])
+        dec = train.decide(counts[:, m])
         alarms = sweep_setting(ds, dec, hours, cache)
         baselines[name] = {"window": train.window_metrics(dec, labels, hours), "alarm": train.choose_alarm(alarms)}
-        print(f"  {name:28s} {fmt(baselines[name]['alarm'])}")
+        log(f"  {name:28s} {fmt(baselines[name]['alarm'])}")
     fixed = acc.fixed_rules(M)
     for label, params in fixed.items():
         baselines[label] = {**evaluate(params), "rule": label}
-        print(f"  {label:28s} {fmt(baselines[label]['alarm'])}")
+        log(f"  {label:28s} {fmt(baselines[label]['alarm'])}")
 
     # Candidates: the fixed rules only (default), the full mode x shift vector x margin grid,
     # or one rounded logistic regression per mode
     logistic = {}
-    if args.search == "fixed":
+    if search == "fixed":
         rows = [baselines[label] for label in fixed]
-        print(f"\nChoosing among the {len(rows)} fixed rules (target FA/h < {train.TARGET_FA_PER_HOUR})...")
-    elif args.search == "grid":
+        log(f"\nChoosing among the {len(rows)} fixed rules (target FA/h < {train.TARGET_FA_PER_HOUR})...")
+    elif search == "grid":
         settings = [acc.make_params(s, m, mode) for mode in args.modes
                     for s in acc.shift_grid(M, args.max_shift) for m in args.margins]
-        print(f"\nSweeping {len(settings)} settings x {len(train.ALARM_NS)} values of N "
-              f"(target FA/h < {train.TARGET_FA_PER_HOUR})...")
+        log(f"\nSweeping {len(settings)} settings x {len(train.ALARM_NS)} values of N "
+            f"(target FA/h < {train.TARGET_FA_PER_HOUR})...")
         rows = [evaluate(p) for p in settings]
+    elif labels.sum() == 0:
+        rows = []
+        log("\nNo seizure windows: cannot fit a logistic regression")
     else:
-        print(f"\nLogistic regression per mode (l2 {args.l2}), rounded to shifts <= {args.max_shift}:")
+        log(f"\nLogistic regression per mode (l2 {args.l2}), rounded to shifts <= {args.max_shift}:")
         rows = []
         for mode in args.modes:
-            X = acc.features(member_counts, mode)
+            X = acc.features(counts, mode)
             w, b = fit_logistic(X, labels, args.l2)
             float_dec = (b + X @ w > 0).astype(np.int64)            # before rounding, for comparison
             float_alarm = train.choose_alarm(sweep_setting(ds, float_dec, hours, cache))
@@ -280,54 +320,139 @@ def fit(args, dirs):
                               "float_window": train.window_metrics(float_dec, labels, hours),
                               "rounded": describe(params, args.members) if params is not None else None}
             weights = ", ".join(f"{m} {x:+.3g}" for m, x in zip(args.members, w))
-            print(f"  {mode:5s} weights [{weights}], bias {b:+.3g}")
-            print(f"        float:   {fmt(float_alarm)}")
+            log(f"  {mode:5s} weights [{weights}], bias {b:+.3g}")
+            log(f"        float:   {fmt(float_alarm)}")
             if params is None:
-                print("        no positive weight: the block cannot express this fit, skipped")
+                log("        no positive weight: the block cannot express this fit, skipped")
                 continue
             rows.append(evaluate(params))
-            print(f"        rounded: {rows[-1]['setting']}  {fmt(rows[-1]['alarm'])}")
+            log(f"        rounded: {rows[-1]['setting']}  {fmt(rows[-1]['alarm'])}")
 
-    def pick(candidates):
-        """The row whose best alarm train.choose_alarm prefers."""
-        chosen_alarm = train.choose_alarm([r["alarm"] for r in candidates])
-        return next(r for r in candidates if r["alarm"] is chosen_alarm)
-
+    # Gate: a weighted setting only replaces the best fixed rule if it is clearly better
     best = best_fixed = pick([baselines[label] for label in fixed])
-    selection = {"best_fixed": best_fixed["rule"], "weights_accepted": False, "reason": f"--search {args.search}"}
-    if args.search != "fixed" and not rows:
+    selection = {"best_fixed": best_fixed["rule"], "weights_accepted": False, "reason": f"--search {search}"}
+    if search != "fixed" and not rows:
         selection["reason"] = "no weighted setting could be expressed: keeping the best fixed rule"
-        print(f"  {selection['reason']}")
-    elif args.search != "fixed":
+        log(f"  {selection['reason']}")
+    elif search != "fixed":
         best_weighted = pick(rows)
         accepted, reason = clearly_better(best_weighted["alarm"], best_fixed["alarm"], args.min_fa_gain)
-        print(f"  best fixed rule: {best_fixed['rule']} = {best_fixed['setting']}  {fmt(best_fixed['alarm'])}")
-        print(f"  best weighted:   {best_weighted['setting']}  {fmt(best_weighted['alarm'])}")
-        print(f"  {'use' if accepted else 'keep the fixed rule, not'} the weighted setting: {reason}")
+        log(f"  best fixed rule: {best_fixed['rule']} = {best_fixed['setting']}  {fmt(best_fixed['alarm'])}")
+        log(f"  best weighted:   {best_weighted['setting']}  {fmt(best_weighted['alarm'])}")
+        log(f"  {'use' if accepted else 'keep the fixed rule, not'} the weighted setting: {reason}")
         selection = {**selection, "best_weighted": best_weighted["setting"], "weights_accepted": accepted,
                      "reason": reason}
         if accepted:
             best = best_weighted
+    return {"best": best, "baselines": baselines, "rows": rows, "selection": selection,
+            "logistic": logistic, "n_decisions": len(cache)}
+
+
+def params_of(row):
+    """Parameter dict of a selected row."""
+    return acc.make_params(row["shift"], row["margin"], {v: k for k, v in acc.MODES.items()}[row["mode"]])
+
+
+def leave_one_recording_out(data, args, procedures):
+    """How well does each selection procedure generalise to a recording it never saw?
+
+    For every validation recording r: run the full procedure (select) on the other recordings,
+    then apply the chosen setting and N, unchanged, to r. Summing over recordings gives an
+    honest estimate of each procedure, including whatever it overfits. Comparing "fixed" with a
+    weighted search shows whether the extra parameters actually generalise. (The members
+    themselves were still early-stopped on all of validation, so this cannot remove that bias.)
+
+    Args:
+        data: Full validation bundle (member_counts, labels, ds, hours).
+        args: Parsed arguments.
+        procedures: Searches to evaluate, e.g. ["fixed", "logistic"].
+
+    Returns:
+        {procedure: {"folds": [...], "total": {...}}}. A fold holds the held-out recording, the
+        setting and N chosen without it, and that recording's seizures, detections, false alarms
+        and delays. The total sums them: sensitivity = detected / seizures, FA/h over all hours.
+    """
+    recs = np.unique(data.ds.rec)
+    out = {}
+    for proc in procedures:
+        folds = []
+        for r in recs:
+            held = data.ds.rec == r
+            chosen = select(subset(data, ~held), args, proc, verbose=False)["best"]
+            test = subset(data, held)
+            n = chosen["alarm"]["n_consec"]
+            _, dec = acc.decide_from_counts(test.member_counts, params_of(chosen))
+            a = train.alarm_metrics(test.ds, dec, n, test.hours, chosen["margin"])
+            folds.append({"recording": data.ds.recordings[r]["recording"], "chosen": chosen["setting"], "n": n,
+                          "hours": test.hours, "seizures": a["seizures"], "detected": a["detected"],
+                          "false_alarms": a["false_alarms"], "mean_delay_s": a["mean_delay_s"]})
+        seizures = sum(f["seizures"] for f in folds)
+        detected = sum(f["detected"] for f in folds)
+        false_alarms = sum(f["false_alarms"] for f in folds)
+        hours = sum(f["hours"] for f in folds)
+        delays = [f["mean_delay_s"] for f in folds if f["mean_delay_s"] is not None]
+        out[proc] = {"folds": folds, "total": {
+            "seizures": seizures, "detected": detected, "sensitivity": train.ratio(detected, seizures),
+            "false_alarms": false_alarms, "hours": hours, "fa_per_hour": train.ratio(false_alarms, hours),
+            "distinct_settings": len({(f["chosen"], f["n"]) for f in folds}),
+            "mean_delay_s": float(np.mean(delays)) if delays else None}}
+    return out
+
+
+def print_cv(cv):
+    """Per-fold table and totals for leave_one_recording_out results."""
+    for proc, res in cv.items():
+        print(f"\n  --search {proc}: chosen without each recording, then scored on it")
+        for f in res["folds"]:
+            delay = f"{f['mean_delay_s']:.1f} s" if f["mean_delay_s"] is not None else "  -  "
+            print(f"    {f['recording']:12s} {f['chosen']:45s} N = {f['n']:2d}: "
+                  f"detected {f['detected']}/{f['seizures']}  false alarms {f['false_alarms']:2d}  delay {delay}")
+        t = res["total"]
+        delay = f"{t['mean_delay_s']:.1f} s" if t["mean_delay_s"] is not None else "-"
+        print(f"    TOTAL: detected {t['detected']}/{t['seizures']}  FA/h {t['fa_per_hour'] or 0:.2f}  "
+              f"mean delay {delay}  ({t['distinct_settings']} distinct settings across {len(res['folds'])} folds)")
+
+
+def fit(args, dirs):
+    member_counts, labels, recording, start = load_member_outputs(dirs, "val")
+    recordings = load_recordings([args.patient], args.cache)
+    ds = dataset_for(recordings, "val", recording, start)
+    hours = train.split_hours(recordings, "val")
+    cfg = acc.make_config(args.members, args.max_shift)
+    print(f"{args.patient} validation: {len(labels)} windows ({int(labels.sum())} seizure), {hours:.1f} h, "
+          f"members {', '.join(args.members)}")
+    data = SimpleNamespace(member_counts=member_counts, labels=labels, ds=ds, hours=hours)
+
+    sel = select(data, args, args.search)
+    best, rows = sel["best"], sel["rows"]
     ranked = sorted(rows, key=lambda r: rank_key(r["alarm"]))
     name = f"{best['rule']} = " if "rule" in best else ""
     print(f"  chosen: {name}{best['setting']}  {fmt(best['alarm'])}")
     print(f"  window level: sens {best['window']['sensitivity'] or 0:.3f}  "
           f"prec {best['window']['precision'] or 0:.3f}  FP/h {best['window']['fp_per_hour'] or 0:.1f}")
-    print(f"  ({len(cache)} distinct decision vectors among {len(rows)} settings and the member baselines)")
+    print(f"  ({sel['n_decisions']} distinct decision vectors among {len(rows)} settings and the member baselines)")
+
+    cv = None
+    if args.cv:
+        procedures = ["fixed"] + ([args.search] if args.search != "fixed" else [])
+        n_recs = len(np.unique(ds.rec))
+        print(f"\nLeave one recording out ({n_recs} validation recordings): is the selection procedure "
+              "itself reliable?")
+        cv = leave_one_recording_out(data, args, procedures)
+        print_cv(cv)
 
     run_dir = args.out / f"{args.patient}_accumulator_{'+'.join(args.members)}_s{args.seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    params = acc.make_params(best["shift"], best["margin"], {v: k for k, v in acc.MODES.items()}[best["mode"]])
-    np.savez(run_dir / "params_int8.npz", **params)
+    np.savez(run_dir / "params_int8.npz", **params_of(best))
     strip = lambda r: {k: v for k, v in r.items() if k != "alarm_sweep"}
     results = {"patient": args.patient, "members": args.members, "member_runs": [str(d) for d in dirs],
                "seed": args.seed, "config": cfg, "args": vars(args), "val_hours": hours,
-               "chosen": {**strip(best), "alarm_n": best["alarm"]["n_consec"]}, "selection": selection,
-               "baselines": {k: strip(v) for k, v in baselines.items()},
-               "search": args.search, "logistic": logistic,
-               "top": [strip(r) for r in ranked[:TOP_K]], "n_settings": len(rows)}
+               "chosen": {**strip(best), "alarm_n": best["alarm"]["n_consec"]}, "selection": sel["selection"],
+               "baselines": {k: strip(v) for k, v in sel["baselines"].items()},
+               "search": args.search, "logistic": sel["logistic"],
+               "top": [strip(r) for r in ranked[:TOP_K]], "n_settings": len(rows), "cv": cv}
     (run_dir / "results.json").write_text(train.to_json(results))
-    print(f"wrote {run_dir / 'results.json'} and params_int8.npz")
+    print(f"\nwrote {run_dir / 'results.json'} and params_int8.npz")
 
 
 def test(args, dirs):
