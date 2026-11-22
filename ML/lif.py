@@ -257,9 +257,11 @@ if torch is not None:
             self.fc2 = nn.Linear(cfg["n_hidden"], cfg["n_outputs"], bias=False)
             # PyTorch's default init is too small here: at ~6% input density the hidden layer
             # barely fires (<1%) and the outputs never do, so surrogate gradients vanish.
-            # std 0.5 gives ~10% hidden activity and output spikes in most windows.
+            # std 0.5 gives ~10% hidden activity and output spikes in most windows. The output
+            # std is scaled by fan-in so that other hidden sizes (--hidden) start the same as 64
+            # instead of pinning an output at 128 spikes per window.
             nn.init.normal_(self.fc1.weight, 0.0, 0.5)
-            nn.init.normal_(self.fc2.weight, 0.0, 0.5)
+            nn.init.normal_(self.fc2.weight, 0.0, 0.5 * (64 / cfg["n_hidden"]) ** 0.5)
             # Fixed (not learnable) leak so it matches v - (v >> k) on hardware
             self.beta = 1.0 - 2.0 ** -cfg["leak_shift"]
             self.scale = cfg["theta"]   # float weight * scale = integer weight

@@ -13,9 +13,10 @@ Models, integer references, and the hardware handoff for the neuromorphic seizur
 | `train.py` | Per-patient training: float -> QAT -> int8, agreement check vs the integer reference, real-window handoff. `python train.py --patient chb01` (`--help` for options). `--set KEY=VALUE` overrides the model's CONFIG, `--float-only` skips QAT / int8 for a hardware model; both are added to the run folder name |
 | `inspect_alarms.py` | Lists a finished run's validation alarms (detection vs false alarm); `--plot` saves a PNG per false alarm |
 | `summarize.py` | One table of every run in `--out` (validation, test if run, cost columns), mean +- std per model / variant; `--csv`, `--md` |
-| `ablate.py` | Runs the Model C ablations (plus `lif` / `alif` for comparison) through `train.py`; resumable. `--dry-run` prints the commands |
+| `ablate.py` | Runs the planned ablations (`planned_ablations.md`) for Models A, B and C through `train.py`; `--groups` picks the sets, resumable. `--dry-run` prints the commands |
 | `diversity.py` | Pairwise disagreement / error correlation / false-positive overlap between runs, and which seizures only one model catches (input to the voter) |
 | `test_scnn.py` | Model C tests: causality, tap mapping, integer reference == QAT forward on every layer, export round-trip, on every config variant |
+| `colab.ipynb` | Colab walkthrough: Drive, clone, download + preprocess, tests, phase 1 (default models), phase 2 (ablation screen). Open it from GitHub in Colab |
 | `export.py` | Writes `handoff/<model>/` for any hardware model: `python export.py lif alif scnn` |
 | `data/` | CHB-MIT pipeline: `preprocess.py` (EDF -> spike cache), `dataset.py` (windows, labels, split). See `data/CLAUDE.md` |
 | `handoff/` | What the hardware team gets. Generated; don't edit by hand |

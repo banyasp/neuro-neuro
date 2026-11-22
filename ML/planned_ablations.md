@@ -39,9 +39,9 @@ Default: 46 inputs, 64 hidden LIF neurons, 2 outputs, leak shift k = 5, int8 wei
 
 | Ablation | Settings | What changes | Why | Status |
 |---|---|---|---|---|
-| Hidden size | 32 / 64 / 128 / 192 | Number of hidden neurons | Weights and adds grow with size; this shows where accuracy stops improving | `--hidden`; not scripted |
-| Leak shift k | 4 / 5 / 6 | How fast the membrane forgets: time constant of about 0.125 / 0.25 / 0.5 s | Sets how much recent history each neuron integrates; changes no hardware cost | `--set leak_shift=...`; not scripted |
-| int8 cost | float vs int8 | Train in float and stop, instead of finishing with quantization-aware training (QAT) and int8 weights | The hardware must run int8. The gap shows how much accuracy quantization costs | `--float-only`; not scripted |
+| Hidden size | 32 / 64 / 128 / 192 | Number of hidden neurons | Weights and adds grow with size; this shows where accuracy stops improving | `--hidden`; in `ablate.py` |
+| Leak shift k | 4 / 5 / 6 | How fast the membrane forgets: time constant of about 0.125 / 0.25 / 0.5 s | Sets how much recent history each neuron integrates; changes no hardware cost | `--set leak_shift=...`; in `ablate.py` |
+| int8 cost | float vs int8 | Train in float and stop, instead of finishing with quantization-aware training (QAT) and int8 weights | The hardware must run int8. The gap shows how much accuracy quantization costs | `--float-only`; in `ablate.py` |
 
 ## Model B: ALIF
 
@@ -51,11 +51,11 @@ is to ignore persistent artifacts that keep a neuron firing.
 
 | Ablation | Settings | What changes | Why | Status |
 |---|---|---|---|---|
-| Adaptation off | `adapt_inc` = 0 | The threshold never rises, so the model becomes Model A | Shows whether adaptation helps at all | `--set`; not scripted |
-| Adaptation strength | `adapt_inc` = 8 / 16 / 32 | How much the threshold rises per spike | Too weak does nothing; too strong silences neurons during a real seizure | `--set`; not scripted |
-| Adaptation time constant | `adapt_shift` = 6 / 7 / 8 (about 0.5 / 1 / 2 s) | How long the raised threshold lasts | Should match how long artifacts persist compared with seizure activity | `--set`; not scripted |
-| Hidden size | 32 / 64 / 128 / 192 | Number of hidden neurons | Same sizes as Model A, so A and B are compared at matched size. ALIF costs more per neuron (an extra adaptation register), so this shows whether that cost pays off | `--hidden`; not scripted |
-| int8 cost | float vs int8 | Same as Model A | Same as Model A | `--float-only`; not scripted |
+| Adaptation off | `adapt_inc` = 0 | The threshold never rises, so the model becomes Model A | Shows whether adaptation helps at all | `--set`; in `ablate.py` |
+| Adaptation strength | `adapt_inc` = 8 / 16 / 32 | How much the threshold rises per spike | Too weak does nothing; too strong silences neurons during a real seizure | `--set`; in `ablate.py` |
+| Adaptation time constant | `adapt_shift` = 6 / 7 / 8 (about 0.5 / 1 / 2 s) | How long the raised threshold lasts | Should match how long artifacts persist compared with seizure activity | `--set`; in `ablate.py` |
+| Hidden size | 32 / 64 / 128 / 192 | Number of hidden neurons | Same sizes as Model A, so A and B are compared at matched size. ALIF costs more per neuron (an extra adaptation register), so this shows whether that cost pays off | `--hidden`; in `ablate.py` |
+| int8 cost | float vs int8 | Same as Model A | Same as Model A | `--float-only`; in `ablate.py` |
 
 ## Model C: SCNN
 
@@ -64,7 +64,7 @@ many past frames it weighs); 4 filters use dilation d = 1 (taps on consecutive f
 reach) and 4 use d = 3 (every third frame, about 359 ms). All 23 channels share the same filters,
 giving 184 spiking neurons. A depthwise spatial stage then combines each filter's output across
 channels, with D = 2 neurons per filter (16 in total), and those feed 2 outputs. 656 weights, leak
-shift k = 5. All runs below are in `ablate.py` except the leak shift.
+shift k = 5. All runs below are in `ablate.py`.
 
 | Name | What changes | Why |
 |---|---|---|
@@ -74,7 +74,7 @@ shift k = 5. All runs below are in `ablate.py` except the leak shift.
 | d124 | 12 filters, 4 each at d = 1, 2, 4 (up to about 475 ms) | Does even longer reach help? Also adds 4 filters, so not a pure single change |
 | k32 | K = 32 at d = 1 (250 ms, every frame used, twice the layer-1 weights) | Is it better to reach far with a long dense filter or with sparse dilated taps? |
 | fc | Spatial stage removed: the 184 neurons connect straight to the 2 outputs (624 weights) | Is the spatial stage worth it? Weight count is about the same, so this tests the structure, not the size |
-| leak shift | k = 4 / 5 / 6 (about 0.125 / 0.25 / 0.5 s) | The leak interacts with the filters' reach, so it may matter more here than in Model A. `--set leak_shift=...`; not yet in `ablate.py` |
+| leak shift | k = 4 / 5 / 6 (about 0.125 / 0.25 / 0.5 s) | The leak interacts with the filters' reach, so it may matter more here than in Model A. In `ablate.py` as `leak4` and `leak6` |
 | float_spiking | Same spiking network, trained in float, no int8 | How much accuracy int8 costs |
 | float_relu | Spikes replaced by ReLU activations; software only | How much accuracy spiking costs, with the architecture held fixed. Cleaner than comparing to the 1D-CNN, which also differs in architecture |
 
