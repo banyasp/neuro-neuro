@@ -53,6 +53,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.stats import rankdata
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
@@ -326,12 +327,28 @@ def predict(model, ds, qat, device, batch=1024):
     return torch.cat(counts).numpy(), hidden / n, inputs / n
 
 
+def margin_auc(counts, labels):
+    """AUROC of the decision margin count1 - count0 (logit1 - logit0 for software models):
+    how well the outputs separate seizure from non-seizure windows, at any threshold."""
+    margin = counts[:, 1].astype(np.float64) - counts[:, 0]
+    pos = labels.astype(bool)
+    n_pos, n_neg = int(pos.sum()), int((~pos).sum())
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+    ranks = rankdata(margin)   # ties get the average rank
+    return float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
+
+
 def evaluate(model, ds, hours, qat, device):
     counts, hidden, inputs = predict(model, ds, qat, device)
     m = window_metrics(decide(counts), ds.labels, hours)
-    # Early-stopping score: F1, or (if this split has no seizure windows) fewest false positives
-    score = m["f1"] if ds.labels.any() else -m["fp"]
-    return {**m, "score": score, "hidden_rate": hidden, "input_rate": inputs, "counts": counts}
+    # Early-stopping score: F1, with the margin AUROC as a tie-break (F1 counts for 1000x more).
+    # Without the tie-break, a model whose F1 stays at 0 (it catches no validation seizure window
+    # yet) never "improves", so the untrained epoch-0 model is kept (chb08 LIF / ALIF screen runs).
+    # If the split has no seizure windows: fewest false positives.
+    auc = margin_auc(counts, ds.labels)
+    score = m["f1"] + 1e-3 * auc if ds.labels.any() else -m["fp"]
+    return {**m, "auc": auc, "score": score, "hidden_rate": hidden, "input_rate": inputs, "counts": counts}
 
 
 def train_epoch(model, ds, draw, qat, opt, class_w, args, device):
@@ -365,7 +382,7 @@ def fmt(m):
     def f(v, spec=".3f"):
         return "-" if v is None else format(v, spec)
     return (f"F1 {f(m['f1'])}  sens {f(m['sensitivity'])}  prec {f(m['precision'])}  "
-            f"FP/h {f(m['fp_per_hour'], '.1f')}  hidden {m['hidden_rate']:.3f}")
+            f"FP/h {f(m['fp_per_hour'], '.1f')}  AUC {f(m.get('auc'))}  hidden {m['hidden_rate']:.3f}")
 
 
 def train(model, ds_train, ds_val, val_hours, args, device, run_dir, hw=True):
@@ -418,7 +435,7 @@ def train(model, ds_train, ds_val, val_hours, args, device, run_dir, hw=True):
             else:
                 bad += 1
             history.append({"stage": stage, "epoch": epoch, "loss": loss,
-                            **{k: ev[k] for k in ("f1", "sensitivity", "precision", "fp_per_hour", "hidden_rate")}})
+                            **{k: ev[k] for k in ("f1", "sensitivity", "precision", "fp_per_hour", "auc", "hidden_rate")}})
             print(f"[{name} {epoch:3d}] loss {loss:.4f}  val {fmt(ev)}{'  *' if improved else ''}")
             torch.save({"stage": stage, "epoch": epoch + 1, "model": model.state_dict(), "opt": opt.state_dict(),
                         "best_score": best, "best_state": best_state, "bad": bad, "history": history,

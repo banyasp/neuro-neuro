@@ -19,6 +19,16 @@ Protocol:
 Validation has only a few seizures per patient, so event-level differences between configs are
 noisy at the screening stage. Window-level F1 and false positives per hour are steadier for screening.
 
+**Selection rule** (decided after the screen, 2026-11-23): pick configs by mean window-level F1 on
+validation across patients and seeds, with FP/h as the second check. When two configs are within one
+standard deviation, take the cheaper one (fewer adds per step). Event-level results (detections, FA/h,
+delay) are reported on test, once, for the final configs only: with 1-2 validation seizures per patient
+they can't separate configs.
+
+**Input density:** the delta threshold stays at alpha = 0.3 for every run, so all results are
+comparable. Measured input spike density at that setting is 18-27% (not the 5-10% first assumed), and
+hardware cost estimates must use the measured adds per step, not the 5% estimate.
+
 ## Shared ablations (every model)
 
 These change the inputs or the alarm logic, so they apply to A, B and C alike. The first two cost
