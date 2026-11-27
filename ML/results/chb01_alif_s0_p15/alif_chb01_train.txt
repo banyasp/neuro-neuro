@@ -1,0 +1,133 @@
+device cuda, run dir /content/drive/MyDrive/ECE662/temp/runs/chb01_alif_s0
+  train:  17 files,   17.0 h, 4 seizures, 122375 windows (312 seizure)
+  val  :   8 files,    7.7 h, 2 seizures, 55718 windows (364 seizure)
+  test :  17 files,   15.8 h, 1 seizures, 113833 windows (201 seizure)
+[float   0] loss 0.5072  val F1 0.000  sens 0.000  prec 0.000  FP/h 43.2  hidden 0.188  *
+[float   1] loss 0.3124  val F1 0.000  sens 0.000  prec 0.000  FP/h 17.8  hidden 0.196
+[float   2] loss 0.2591  val F1 0.005  sens 0.003  prec 0.018  FP/h 7.1  hidden 0.196  *
+[float   3] loss 0.2336  val F1 0.000  sens 0.000  prec 0.000  FP/h 7.8  hidden 0.199
+[float   4] loss 0.2258  val F1 0.000  sens 0.000  prec 0.000  FP/h 4.8  hidden 0.201
+[float   5] loss 0.2143  val F1 0.000  sens 0.000  prec 0.000  FP/h 2.2  hidden 0.198
+[float   6] loss 0.2132  val F1 0.000  sens 0.000  prec 0.000  FP/h 4.1  hidden 0.200
+[float   7] loss 0.2083  val F1 0.000  sens 0.000  prec 0.000  FP/h 1.8  hidden 0.198
+[float   8] loss 0.2016  val F1 0.000  sens 0.000  prec 0.000  FP/h 4.7  hidden 0.199
+[float   9] loss 0.1988  val F1 0.000  sens 0.000  prec 0.000  FP/h 3.7  hidden 0.195
+[float  10] loss 0.1924  val F1 0.000  sens 0.000  prec 0.000  FP/h 4.3  hidden 0.194
+[float  11] loss 0.1987  val F1 0.005  sens 0.003  prec 0.033  FP/h 3.7  hidden 0.193  *
+[float  12] loss 0.1906  val F1 0.005  sens 0.003  prec 0.037  FP/h 3.4  hidden 0.191  *
+[float  13] loss 0.1885  val F1 0.009  sens 0.005  prec 0.023  FP/h 10.9  hidden 0.196  *
+[float  14] loss 0.1931  val F1 0.062  sens 0.047  prec 0.093  FP/h 21.4  hidden 0.196  *
+[float  15] loss 0.1762  val F1 0.232  sens 0.247  prec 0.218  FP/h 41.6  hidden 0.194  *
+[float  16] loss 0.1873  val F1 0.223  sens 0.283  prec 0.184  FP/h 58.9  hidden 0.205
+[float  17] loss 0.1519  val F1 0.189  sens 0.582  prec 0.113  FP/h 216.0  hidden 0.204
+[float  18] loss 0.1440  val F1 0.293  sens 0.354  prec 0.250  FP/h 50.0  hidden 0.209  *
+[float  19] loss 0.1231  val F1 0.282  sens 0.462  prec 0.203  FP/h 85.1  hidden 0.215
+[float  20] loss 0.1113  val F1 0.264  sens 0.310  prec 0.230  FP/h 48.8  hidden 0.220
+[float  21] loss 0.0964  val F1 0.317  sens 0.681  prec 0.207  FP/h 123.0  hidden 0.225  *
+[float  22] loss 0.0832  val F1 0.410  sens 0.563  prec 0.322  FP/h 55.8  hidden 0.217  *
+[float  23] loss 0.0699  val F1 0.331  sens 0.407  prec 0.279  FP/h 49.5  hidden 0.219
+[float  24] loss 0.0963  val F1 0.349  sens 0.484  prec 0.273  FP/h 60.6  hidden 0.224
+[float  25] loss 0.0639  val F1 0.354  sens 0.747  prec 0.232  FP/h 116.3  hidden 0.222
+[float  26] loss 0.0825  val F1 0.253  sens 0.915  prec 0.147  FP/h 250.4  hidden 0.228
+[float  27] loss 0.1090  val F1 0.373  sens 0.816  prec 0.242  FP/h 120.3  hidden 0.227
+[float  28] loss 0.0503  val F1 0.371  sens 0.813  prec 0.240  FP/h 121.1  hidden 0.224
+[float  29] loss 0.0615  val F1 0.458  sens 0.706  prec 0.339  FP/h 64.7  hidden 0.224  *
+[float  30] loss 0.0608  val F1 0.418  sens 0.662  prec 0.306  FP/h 70.7  hidden 0.229
+[float  31] loss 0.0570  val F1 0.397  sens 0.819  prec 0.262  FP/h 108.7  hidden 0.225
+[float  32] loss 0.0576  val F1 0.377  sens 0.788  prec 0.248  FP/h 112.7  hidden 0.223
+[float  33] loss 0.0647  val F1 0.499  sens 0.651  prec 0.404  FP/h 45.1  hidden 0.228  *
+[float  34] loss 0.0587  val F1 0.396  sens 0.629  prec 0.288  FP/h 73.0  hidden 0.228
+[float  35] loss 0.1019  val F1 0.386  sens 0.805  prec 0.253  FP/h 111.5  hidden 0.224
+[float  36] loss 0.0457  val F1 0.345  sens 0.832  prec 0.218  FP/h 140.4  hidden 0.223
+[float  37] loss 0.0470  val F1 0.415  sens 0.750  prec 0.287  FP/h 87.6  hidden 0.222
+[float  38] loss 0.0492  val F1 0.440  sens 0.709  prec 0.319  FP/h 71.1  hidden 0.224
+[float  39] loss 0.0974  val F1 0.451  sens 0.750  prec 0.322  FP/h 74.2  hidden 0.222
+[float  40] loss 0.0549  val F1 0.511  sens 0.632  prec 0.428  FP/h 39.7  hidden 0.221  *
+[float  41] loss 0.0566  val F1 0.531  sens 0.714  prec 0.423  FP/h 45.9  hidden 0.222  *
+[float  42] loss 0.0427  val F1 0.573  sens 0.585  prec 0.561  FP/h 21.6  hidden 0.221  *
+[float  43] loss 0.0466  val F1 0.538  sens 0.692  prec 0.440  FP/h 41.5  hidden 0.222
+[float  44] loss 0.0336  val F1 0.530  sens 0.673  prec 0.438  FP/h 40.7  hidden 0.221
+[float  45] loss 0.0415  val F1 0.489  sens 0.648  prec 0.392  FP/h 47.3  hidden 0.224
+[float  46] loss 0.0334  val F1 0.476  sens 0.739  prec 0.351  FP/h 64.2  hidden 0.226
+[float  47] loss 0.0382  val F1 0.516  sens 0.739  prec 0.397  FP/h 52.8  hidden 0.223
+[float  48] loss 0.0474  val F1 0.448  sens 0.791  prec 0.312  FP/h 81.9  hidden 0.224
+[float  49] loss 0.0324  val F1 0.540  sens 0.665  prec 0.455  FP/h 37.5  hidden 0.226
+[float  50] loss 0.0457  val F1 0.494  sens 0.758  prec 0.367  FP/h 61.6  hidden 0.225
+[float  51] loss 0.0404  val F1 0.544  sens 0.657  prec 0.464  FP/h 35.7  hidden 0.222
+[float  52] loss 0.0408  val F1 0.435  sens 0.816  prec 0.297  FP/h 91.0  hidden 0.226
+[float  53] loss 0.0395  val F1 0.547  sens 0.690  prec 0.454  FP/h 39.0  hidden 0.223
+[float  54] loss 0.0350  val F1 0.469  sens 0.780  prec 0.336  FP/h 72.6  hidden 0.225
+[float  55] loss 0.0452  val F1 0.361  sens 0.871  prec 0.228  FP/h 138.8  hidden 0.224
+[float  56] loss 0.0247  val F1 0.526  sens 0.783  prec 0.396  FP/h 56.1  hidden 0.223
+[float  57] loss 0.0393  val F1 0.446  sens 0.821  prec 0.306  FP/h 87.6  hidden 0.222
+stage 2 start (rounded stage-1 weights): F1 0.574  sens 0.580  prec 0.569  FP/h 20.7  hidden 0.219
+[QAT   0] loss 0.0464  val F1 0.529  sens 0.709  prec 0.422  FP/h 45.7  hidden 0.221
+[QAT   1] loss 0.0237  val F1 0.536  sens 0.709  prec 0.431  FP/h 43.9  hidden 0.221
+[QAT   2] loss 0.0313  val F1 0.532  sens 0.701  prec 0.429  FP/h 43.8  hidden 0.221
+[QAT   3] loss 0.0324  val F1 0.530  sens 0.690  prec 0.431  FP/h 42.9  hidden 0.221
+[QAT   4] loss 0.0259  val F1 0.530  sens 0.714  prec 0.421  FP/h 46.1  hidden 0.221
+[QAT   5] loss 0.0366  val F1 0.537  sens 0.709  prec 0.432  FP/h 43.8  hidden 0.221
+[QAT   6] loss 0.0279  val F1 0.515  sens 0.728  prec 0.398  FP/h 51.8  hidden 0.221
+[QAT   7] loss 0.0307  val F1 0.521  sens 0.728  prec 0.405  FP/h 50.3  hidden 0.220
+[QAT   8] loss 0.0281  val F1 0.540  sens 0.706  prec 0.437  FP/h 42.8  hidden 0.220
+[QAT   9] loss 0.0288  val F1 0.522  sens 0.736  prec 0.404  FP/h 51.0  hidden 0.220
+[QAT  10] loss 0.0236  val F1 0.529  sens 0.720  prec 0.419  FP/h 47.0  hidden 0.220
+[QAT  11] loss 0.0286  val F1 0.541  sens 0.692  prec 0.444  FP/h 40.7  hidden 0.220
+[QAT  12] loss 0.0297  val F1 0.544  sens 0.684  prec 0.452  FP/h 39.0  hidden 0.220
+[QAT  13] loss 0.0278  val F1 0.538  sens 0.692  prec 0.440  FP/h 41.5  hidden 0.220
+[QAT  14] loss 0.0231  val F1 0.533  sens 0.698  prec 0.431  FP/h 43.3  hidden 0.220
+
+final int8 model, val: F1 0.574  sens 0.580  prec 0.569  FP/h 20.7  hidden 0.219
+
+Validation, window level (margin 0 = current spec; others would need a spec change):
+  count1 - count0 > 0:  sens 0.580  prec 0.569  FP/h 20.7
+  count1 - count0 > 1:  sens 0.555  prec 0.643  FP/h 14.5
+  count1 - count0 > 2:  sens 0.519  prec 0.695  FP/h 10.7
+  count1 - count0 > 4:  sens 0.459  prec 0.759  FP/h 6.8
+  count1 - count0 > 8:  sens 0.332  prec 0.858  FP/h 2.6
+
+Validation, alarm level (alarm after N consecutive positive windows, target FA/h < 0.2):
+  N =  1: detected 2/2  FA/h 17.96  mean delay 2.5 s
+  N =  2: detected 2/2  FA/h 2.33  mean delay 4.2 s
+  N =  3: detected 2/2  FA/h 0.39  mean delay 5.5 s
+  N =  4: detected 2/2  FA/h 0.00  mean delay 6.0 s
+  N =  5: detected 2/2  FA/h 0.00  mean delay 6.5 s
+  N =  6: detected 2/2  FA/h 0.00  mean delay 7.0 s
+  N =  7: detected 2/2  FA/h 0.00  mean delay 7.5 s
+  N =  8: detected 2/2  FA/h 0.00  mean delay 8.0 s
+  N =  9: detected 2/2  FA/h 0.00  mean delay 8.5 s
+  N = 10: detected 2/2  FA/h 0.00  mean delay 9.0 s
+  chosen N = 4
+
+agreement with run_int_reference on 2000 val windows: 0 count mismatches, 0 decision mismatches
+wrote /content/drive/MyDrive/ECE662/temp/runs/chb01_alif_s0/weights_int8.npz and results.json
+wrote /content/drive/MyDrive/ECE662/temp/runs/chb01_alif_s0/handoff
+device cuda, run dir /content/drive/MyDrive/ECE662/662 Neuromorph/alif-training/runs/chb01_alif_s0, n_hidden 64
+
+Validation, alarm level (alarm after N consecutive positive windows, margin 0 = spec):
+  m =  0, N =  1: detected 2/2  FA/h 7.11  mean delay 2.5 s
+  m =  0, N =  2: detected 2/2  FA/h 1.94  mean delay 4.2 s
+  m =  0, N =  3: detected 2/2  FA/h 0.26  mean delay 5.5 s
+  m =  0, N =  4: detected 2/2  FA/h 0.00  mean delay 6.0 s
+  m =  0, N =  5: detected 2/2  FA/h 0.00  mean delay 6.5 s
+  m =  0, N =  6: detected 2/2  FA/h 0.00  mean delay 7.0 s
+  m =  0, N =  7: detected 2/2  FA/h 0.00  mean delay 7.5 s
+  m =  0, N =  8: detected 2/2  FA/h 0.00  mean delay 8.0 s
+  m =  0, N =  9: detected 2/2  FA/h 0.00  mean delay 8.5 s
+  m =  0, N = 10: detected 2/2  FA/h 0.00  mean delay 9.0 s
+
+Margin ablation (seizure if count1 - count0 > m; m > 0 needs a spec change). Best N per margin, target FA/h < 0.2:
+  window sens 0.580  prec 0.569  FP/h  20.7  |  m =  0, N =  4: detected 2/2  FA/h 0.00  mean delay 6.0 s
+  window sens 0.555  prec 0.643  FP/h  14.5  |  m =  1, N =  3: detected 2/2  FA/h 0.13  mean delay 5.5 s
+  window sens 0.519  prec 0.695  FP/h  10.7  |  m =  2, N =  3: detected 2/2  FA/h 0.13  mean delay 5.5 s
+  window sens 0.489  prec 0.721  FP/h   8.9  |  m =  3, N =  3: detected 2/2  FA/h 0.00  mean delay 5.8 s
+  window sens 0.459  prec 0.759  FP/h   6.8  |  m =  4, N =  3: detected 2/2  FA/h 0.00  mean delay 5.8 s
+  window sens 0.382  prec 0.808  FP/h   4.3  |  m =  6, N =  3: detected 2/2  FA/h 0.00  mean delay 6.2 s
+  window sens 0.332  prec 0.858  FP/h   2.6  |  m =  8, N =  3: detected 2/2  FA/h 0.00  mean delay 6.2 s
+  window sens 0.225  prec 0.901  FP/h   1.2  |  m = 12, N =  2: detected 2/2  FA/h 0.13  mean delay 6.8 s
+  window sens 0.115  prec 0.875  FP/h   0.8  |  m = 16, N =  2: detected 2/2  FA/h 0.00  mean delay 6.8 s
+  window sens 0.030  prec 1.000  FP/h   0.0  |  m = 24, N =  1: detected 2/2  FA/h 0.00  mean delay 7.2 s
+  window sens 0.008  prec 1.000  FP/h   0.0  |  m = 32, N =  1: detected 2/2  FA/h 0.00  mean delay 9.0 s
+  spec choice: m =  0, N =  4: detected 2/2  FA/h 0.00  mean delay 6.0 s
+  best choice: m =  1, N =  3: detected 2/2  FA/h 0.13  mean delay 5.5 s
+updated /content/drive/MyDrive/ECE662/662 Neuromorph/alif-training/runs/chb01_alif_s0/results.json and wrote val_outputs.npz
