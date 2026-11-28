@@ -15,7 +15,7 @@ Protocol:
    `--workers` = runs at once, about the CPU core count minus 1; see `colab.ipynb` section 10).
 2. **Confirm** the defaults and the strongest variants on every patient with 2 seeds:
    `python ablate.py --groups confirm --patients chb01 chb03 chb05 chb08 chb10 --seeds 0 1 --workers N`
-   (`ablate.py` `CONFIRM`: each model's default and k = 4, plus SCNN `d1` and `k1` at k = 4).
+   (`ablate.py` `CONFIRM`: each model's default and k = 4, SCNN `d1` and `k1` at k = 4, and the CNN baseline).
    Add variants from the new screen runs with `--only` if they clearly win.
 3. **Compare on validation only.** Test is scored once, at the end, for the final configurations.
 4. **Report** event-level results (false alarms per hour, seizures detected, onset delay) alongside
@@ -43,10 +43,10 @@ nothing extra: every training run sweeps them automatically.
 |---|---|---|---|---|
 | Alarm persistence N | 1 to 10 windows | Number of consecutive positive windows before an alarm | Trades false alarms against detection delay; N = 2 to 3 keeps us near the 2 s target | Swept in every run |
 | Decision margin m | 0 and up | A window is positive if seizure spikes exceed non-seizure spikes by more than m | A cheap way to make a model more conservative without retraining | Swept in every run |
-| Window length | 0.5 / 1 / 2 s | Length of each window; the step stays at half a window | 0.5 s holds only about 1.5 cycles of a 3 Hz seizure rhythm; 2 s adds context but delays decisions | In `ablate.py` for Models A and B (`lif_win05`, `lif_win2`, `alif_win05`, `alif_win2`) |
-| Channel subsets | 23 / 22 / 21 channels, or other combinations | Which EEG channels feed the model | Two of the 23 are redundant; fewer channels mean fewer input lines and less hardware | Needs a preprocessed cache per channel set |
-| Hybrid encoding | delta only vs delta + rate-coded | Adds rate-coded spikes (spike probability from signal amplitude) alongside the delta spikes | Prior work found the hybrid much better than either encoding alone | Needs a new encoder in the pipeline |
-| Delta threshold alpha | 0.2 / 0.3 / 0.5 | How big a signal change triggers an input spike | Input spike density sets most of the hardware cost; higher alpha means fewer spikes | Needs a preprocessed cache per value |
+| Window length | 0.5 / 1 / 2 s | Length of each window; the step stays at half a window | 0.5 s holds only about 1.5 cycles of a 3 Hz seizure rhythm; 2 s adds context but delays decisions | In `ablate.py` for every SNN (`lif_win05` / `lif_win2`, `alif_...`, `win05` / `win2` for SCNN, `scnn_alif_...`) |
+| Channel subsets | 23 / 22 / 21 channels, or other combinations | Which EEG channels feed the model | Two of the 23 are redundant; fewer channels mean fewer input lines and less hardware | **Not run: future work.** Needs a preprocessed cache per channel set (pipeline code not written) |
+| Hybrid encoding | delta only vs delta + rate-coded | Adds rate-coded spikes (spike probability from signal amplitude) alongside the delta spikes | Prior work found the hybrid much better than either encoding alone | **Not run: future work.** Needs a new encoder in the pipeline |
+| Delta threshold alpha | 0.2 / 0.3 / 0.5 | How big a signal change triggers an input spike | Input spike density sets most of the hardware cost; higher alpha means fewer spikes | **Not run: future work.** Kept at 0.3 for every run so all results are comparable |
 
 ## Model A: LIF
 
@@ -91,6 +91,7 @@ shift k = 5. All runs below are in `ablate.py`.
 | k32 | K = 32 at d = 1 (250 ms, every frame used, twice the layer-1 weights) | Is it better to reach far with a long dense filter or with sparse dilated taps? |
 | fc | Spatial stage removed: the 184 neurons connect straight to the 2 outputs (624 weights) | Is the spatial stage worth it? Weight count is about the same, so this tests the structure, not the size |
 | leak shift | k = 4 / 5 / 6 (about 0.125 / 0.25 / 0.5 s) | The leak interacts with the filters' reach, so it may matter more here than in Model A. In `ablate.py` as `leak4` and `leak6` |
+| win05 / win2 | Window 0.5 s / 2 s (the shared window-length ablation) | Does the convolutional model need a longer window than the 46-frame filters already see? |
 | float_spiking | Same spiking network, trained in float, no int8 | How much accuracy int8 costs |
 | float_relu | Spikes replaced by ReLU activations; software only | How much accuracy spiking costs, with the architecture held fixed. Cleaner than comparing to the 1D-CNN, which also differs in architecture |
 
@@ -124,6 +125,7 @@ adaptation knobs. `float_relu` has no ALIF twin (ReLUs have no threshold to adap
 | scnn_alif_leak4 / _leak6 | Leak k = 4 / 6 | `leak4` / `leak6` |
 | scnn_alif_inc8 / _inc32 | Adaptation strength `adapt_inc` 8 / 32 | `scnn_alif` (Model B's `alif_inc8` / `alif_inc32`) |
 | scnn_alif_ashift6 / _ashift8 | Adaptation time constant about 0.5 / 2 s | `scnn_alif` (Model B's `alif_ashift6` / `alif_ashift8`) |
+| scnn_alif_win05 / _win2 | Window 0.5 s / 2 s | `win05` / `win2` |
 
 ## Cross-model analysis
 
@@ -132,7 +134,8 @@ adaptation knobs. `float_relu` has no ALIF twin (ReLUs have no threshold to adap
   An ensemble only helps if the models make different mistakes, so this is the input to the voter
   design (the voter itself is a teammate's part).
 - **1D-CNN baseline:** one non-spiking reference model on the same windows, preprocessing and split
-  as the SNNs. No ablations planned; it's the comparison point for research question 1.
+  as the SNNs. No ablations planned; it's the comparison point for research question 1. Seeds 0 and 1
+  on every patient, in the `confirm` group.
 
 ## Stretch goal: streaming instead of windows
 

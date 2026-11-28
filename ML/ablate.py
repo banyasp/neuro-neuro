@@ -53,6 +53,8 @@ ABLATIONS = {
     "float_relu": ("4a. cost of spiking: float, non-spiking twin", ["--model", "scnn_float"]),
     "leak4": ("leak: k = 4 (tau ~ 0.125 s)", ["--model", "scnn", "--set", "leak_shift=4"]),
     "leak6": ("leak: k = 6 (tau ~ 0.5 s)", ["--model", "scnn", "--set", "leak_shift=6"]),
+    "win05": ("window 0.5 s (64 steps, step 0.25 s)", ["--model", "scnn", "--window", "0.5"]),
+    "win2": ("window 2 s (256 steps, step 1 s)", ["--model", "scnn", "--window", "2"]),
 }
 # Model A (lif) and Model B (alif): one factor at a time from their default CONFIG
 # (64 hidden, k = 5; alif adapt_inc = 16, adapt_shift = 7). See planned_ablations.md.
@@ -98,6 +100,8 @@ SCNN_ALIF_ABLATIONS = {
     "scnn_alif_inc32": ("C-ALIF: stronger adaptation (adapt_inc = 32)", SA + ["--set", "adapt_inc=32"]),
     "scnn_alif_ashift6": ("C-ALIF: shorter adaptation (adapt_shift = 6, tau ~ 0.5 s)", SA + ["--set", "adapt_shift=6"]),
     "scnn_alif_ashift8": ("C-ALIF: longer adaptation (adapt_shift = 8, tau ~ 2 s)", SA + ["--set", "adapt_shift=8"]),
+    "scnn_alif_win05": ("C-ALIF: window 0.5 s (vs win05)", SA + ["--window", "0.5"]),
+    "scnn_alif_win2": ("C-ALIF: window 2 s (vs win2)", SA + ["--window", "2"]),
 }
 # Stage 2: the defaults and the strongest screen results, on every patient with 2 seeds
 # (python ablate.py --groups confirm --patients ... --seeds 0 1). Add more names with --only once
@@ -113,6 +117,7 @@ CONFIRM = {
     "k1_leak4": ("C: K = 1, leak k = 4", ["--model", "scnn", "--set", "kernel_len=1", "leak_shift=4"]),
     "scnn_alif": ("C-ALIF: default", SA),
     "scnn_alif_leak4": ("C-ALIF: leak k = 4", SA + ["--set", "leak_shift=4"]),
+    "cnn": ("1D-CNN baseline (software only), for the model comparison", ["--model", "cnn"]),
 }
 GROUPS = {"scnn": "Model C must-do (plus lif / alif defaults)", "lif": "Model A sweeps",
           "alif": "Model B sweeps", "nice": "Model C nice-to-have",
