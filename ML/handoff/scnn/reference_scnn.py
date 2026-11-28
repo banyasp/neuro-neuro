@@ -22,7 +22,10 @@ CONFIG = {'fs': 128,
  'share_filters': True,
  'n_outputs': 2,
  'leak_shift': 5,
- 'theta': 64}
+ 'theta': 64,
+ 'neuron': 'lif',
+ 'adapt_shift': 7,
+ 'adapt_inc': 16}
 
 W_MIN = -(2 ** (CONFIG["weight_bits"] - 1))
 W_MAX = 2 ** (CONFIG["weight_bits"] - 1) - 1
@@ -75,23 +78,42 @@ def tap_inputs(spikes, t, d, K):
     return x.reshape(K, -1, 2).transpose(1, 0, 2).reshape(spikes.shape[1] // 2, 2 * K)
 
 
+def conv_integrate(v, x, W):
+    """Integrate step of a layer-1 filter group, every channel at once: for each input i = 2k + p
+    in ascending order, add W[i] to the channels whose input i spiked, saturating after every add.
+
+    v: int32 [n_ch, n_filters] (updated in place and returned);  x: 0/1 [n_ch, 2K] from tap_inputs
+    W: int8 [2K, n_filters] (shared by every channel) or [n_ch, 2K, n_filters] (one bank per channel)
+    """
+    for i in range(x.shape[1]):
+        on = x[:, i] == 1                                  # channels whose input i spiked
+        if on.any():
+            w = W[i] if W.ndim == 2 else W[on, i]
+            v[on] = np.clip(v[on] + w.astype(np.int32), V_MIN, V_MAX)
+    return v
+
+
 def conv_step_int(v, x, W, k, theta):
     """One timestep of one layer-1 filter group, every channel at once. The same neuron math as
     lif.lif_step_int; each row is one channel, which has its own active inputs.
-
-    v: int32 [n_ch, n_filters];  x: 0/1 [n_ch, 2K] from tap_inputs
-    W: int8 [2K, n_filters] (shared by every channel) or [n_ch, 2K, n_filters] (one bank per channel)
-    Returns (new v, spikes uint8 [n_ch, n_filters]).
-    """
+    Returns (new v, spikes uint8 [n_ch, n_filters])."""
     v = v - (v >> k)                                       # 1. leak
-    for i in range(x.shape[1]):                            # 2. integrate, input 2k + p ascending
-        on = x[:, i] == 1                                  #    channels whose input i spiked
-        if on.any():
-            w = W[i] if W.ndim == 2 else W[on, i]
-            v[on] = np.clip(v[on] + w.astype(np.int32), V_MIN, V_MAX)   # saturate after every add
+    v = conv_integrate(v, x, W)                            # 2. integrate + saturate
     s = (v >= theta).astype(np.uint8)                      # 3. fire
     v = v - s.astype(np.int32) * theta                     # 4. reset by subtraction
     return v, s
+
+
+def conv_alif_step_int(v, a, x, W, k, theta, k_a, inc):
+    """ALIF version of conv_step_int (neuron = "alif"): the same math as alif.alif_step_int.
+    a: int32 [n_ch, n_filters] adaptation. Returns (new v, new a, spikes uint8 [n_ch, n_filters])."""
+    v = v - (v >> k)                                       # 1. leak membrane
+    a = a - (a >> k_a)                                     # 2. leak adaptation
+    v = conv_integrate(v, x, W)                            # 3. integrate + saturate
+    s = (v >= theta + a).astype(np.uint8)                  # 4. fire against the adapted threshold
+    v = v - s.astype(np.int32) * theta                     # 5. reset by the base threshold
+    a = a + s.astype(np.int32) * inc                       # 6. adapt
+    return v, a, s
 
 
 def lif_step_int(v, s_in, W, k, theta):
@@ -117,6 +139,34 @@ def lif_step_int(v, s_in, W, k, theta):
     return v, s_out
 
 
+def alif_step_int(v, a, s_in, W, k, theta, k_a, inc):
+    """One timestep of one integer ALIF layer.
+
+    v:    int32 array [n_out], current membrane (always within int16 range)
+    a:    int32 array [n_out], current adaptation (always in [0, (inc + 1) * 2^k_a))
+    s_in: 0/1 array [n_in], input spikes this timestep
+    W:    int8 array [n_in, n_out]
+    Returns (new v, new a, output spikes as uint8 [n_out]).
+    """
+    # 1-2. Leak membrane and adaptation. NumPy >> on signed ints is an arithmetic shift, like Verilog >>>.
+    v = v - (v >> k)
+    a = a - (a >> k_a)
+
+    # 3. Integrate + saturate, one input row at a time, in increasing input index.
+    for i in np.flatnonzero(s_in):
+        v = np.clip(v + W[i].astype(np.int32), V_MIN, V_MAX)
+
+    # 4. Fire against the adapted threshold
+    s_out = (v >= theta + a).astype(np.uint8)
+
+    # 5. Reset by subtracting the BASE threshold (v >= theta + a >= theta > 0, so no underflow)
+    v = v - s_out.astype(np.int32) * theta
+
+    # 6. Adapt: every spike raises this neuron's threshold
+    a = a + s_out.astype(np.int32) * inc
+    return v, a, s_out
+
+
 def run_int_reference(spikes, weights, cfg=CONFIG):
     """Run one window through the integer model.
 
@@ -136,30 +186,43 @@ def run_int_reference(spikes, weights, cfg=CONFIG):
 
     n_ch, K, n_out = cfg["n_channels"], cfg["kernel_len"], cfg["n_outputs"]
     k, theta = cfg["leak_shift"], cfg["theta"]
+    k_a, inc = cfg["adapt_shift"], cfg["adapt_inc"]
+    alif = cfg["neuron"] == "alif"       # hidden layers (1, and 2 if depthwise) are ALIF; output stays LIF
+    assert cfg["neuron"] in ("lif", "alif"), cfg["neuron"]
+    # a never exceeds (inc + 1) * 2^k_a - 1, so a and theta + a fit in int16 without saturation
+    assert not alif or theta + ((inc + 1) << k_a) <= V_MAX, "adaptation could overflow int16"
     C = sum(cfg["group_filters"])
     depthwise = cfg["readout"] == "depthwise"
     n2 = C * cfg["depth_mult"] if depthwise else n_out    # layer-2 size
     W1 = weights["l1"]
 
     v1 = np.zeros((n_ch, C), dtype=np.int32)
+    a1 = np.zeros((n_ch, C), dtype=np.int32)
     v2 = np.zeros(n2, dtype=np.int32)
+    a2 = np.zeros(n2, dtype=np.int32)
     v3 = np.zeros(n_out, dtype=np.int32)
     mem1 = np.zeros((T, n_ch * C), dtype=np.int16)
+    adapt1 = np.zeros((T, n_ch * C), dtype=np.int16)
     spk1 = np.zeros((T, n_ch * C), dtype=np.uint8)
     mem2 = np.zeros((T, n2), dtype=np.int16)
+    adapt2 = np.zeros((T, n2), dtype=np.int16)
     spk2 = np.zeros((T, n2), dtype=np.uint8)
     mem3 = np.zeros((T, n_out), dtype=np.int16)
     spk3 = np.zeros((T, n_out), dtype=np.uint8)
 
     for t in range(T):
-        # Layer 1: in each filter group, neuron (ch, f) is an LIF neuron whose 2K inputs are
-        # channel ch's delayed spikes, with weights W1[:, f].
+        # Layer 1: in each filter group, neuron (ch, f) is an LIF (or ALIF) neuron whose 2K inputs
+        # are channel ch's delayed spikes, with weights W1[:, f].
         s1 = np.zeros((n_ch, C), dtype=np.uint8)
         W = W1 if cfg["share_filters"] else W1.reshape(n_ch, 2 * K, C)
-        for d, a, b in filter_groups(cfg):
+        for d, f0, f1 in filter_groups(cfg):
             x = tap_inputs(spikes, t, d, K)
-            v1[:, a:b], s1[:, a:b] = conv_step_int(v1[:, a:b], x, W[..., a:b], k, theta)
-        mem1[t], spk1[t] = v1.reshape(-1), s1.reshape(-1)
+            if alif:
+                v1[:, f0:f1], a1[:, f0:f1], s1[:, f0:f1] = conv_alif_step_int(
+                    v1[:, f0:f1], a1[:, f0:f1], x, W[..., f0:f1], k, theta, k_a, inc)
+            else:
+                v1[:, f0:f1], s1[:, f0:f1] = conv_step_int(v1[:, f0:f1], x, W[..., f0:f1], k, theta)
+        mem1[t], adapt1[t], spk1[t] = v1.reshape(-1), a1.reshape(-1), s1.reshape(-1)
 
         if depthwise:
             # Layer 2: filter f's D units see only filter f's 23 layer-1 neurons, ch ascending
@@ -167,19 +230,27 @@ def run_int_reference(spikes, weights, cfg=CONFIG):
             s2 = np.zeros(n2, dtype=np.uint8)
             for f in range(C):
                 u = slice(f * D, (f + 1) * D)
-                v2[u], s2[u] = lif_step_int(v2[u], s1[:, f], weights["l2"][:, u], k, theta)
-            # Layer 3: fully connected, input f * D + j ascending
+                if alif:
+                    v2[u], a2[u], s2[u] = alif_step_int(v2[u], a2[u], s1[:, f], weights["l2"][:, u],
+                                                        k, theta, k_a, inc)
+                else:
+                    v2[u], s2[u] = lif_step_int(v2[u], s1[:, f], weights["l2"][:, u], k, theta)
+            # Layer 3 (output, always LIF): fully connected, input f * D + j ascending
             v3, s3 = lif_step_int(v3, s2, weights["l3"], k, theta)
-            mem2[t], spk2[t], mem3[t], spk3[t] = v2, s2, v3, s3
+            mem2[t], adapt2[t], spk2[t], mem3[t], spk3[t] = v2, a2, s2, v3, s3
         else:
-            # Readout "fc": layer 2 is the output layer, input ch * C + f ascending
+            # Readout "fc": layer 2 is the output layer (LIF), input ch * C + f ascending
             v2, s2 = lif_step_int(v2, s1.reshape(-1), weights["l2"], k, theta)
             mem2[t], spk3[t] = v2, s2
 
     counts = spk3.sum(axis=0).astype(np.int32)
     r = {"mem_l1": mem1, "spk_l1": spk1, "mem_l2": mem2}
+    if alif:
+        r["adapt_l1"] = adapt1
     if depthwise:
         r.update({"spk_l2": spk2, "mem_l3": mem3})
+        if alif:
+            r["adapt_l2"] = adapt2
     return {**r, "out": spk3, "counts": counts, "decision": int(counts[1] > counts[0])}
 
 

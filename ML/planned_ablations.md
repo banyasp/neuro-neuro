@@ -1,6 +1,6 @@
 # Planned ablations
 
-As of 2026-11-19.
+As of 2026-11-27.
 
 ## Overview
 
@@ -10,8 +10,13 @@ compare, whether an ensemble helps, and what each design choice costs in hardwar
 
 Protocol:
 
-1. **Screen** every ablation on 2 patients (chb01, chb03) with 1 seed.
-2. **Shortlist** the ablations that matter and rerun them with 3 seeds on every patient.
+1. **Screen** every ablation on 2 patients (chb01, chb03) with 1 seed:
+   `python ablate.py --patients chb01 chb03 --seeds 0 --workers N` (default groups; finished runs are skipped;
+   `--workers` = runs at once, about the CPU core count minus 1; see `colab.ipynb` section 10).
+2. **Confirm** the defaults and the strongest variants on every patient with 2 seeds:
+   `python ablate.py --groups confirm --patients chb01 chb03 chb05 chb08 chb10 --seeds 0 1 --workers N`
+   (`ablate.py` `CONFIRM`: each model's default and k = 4, plus SCNN `d1` and `k1` at k = 4).
+   Add variants from the new screen runs with `--only` if they clearly win.
 3. **Compare on validation only.** Test is scored once, at the end, for the final configurations.
 4. **Report** event-level results (false alarms per hour, seizures detected, onset delay) alongside
    cost (weights, worst-case and measured adds per timestep).
@@ -38,7 +43,7 @@ nothing extra: every training run sweeps them automatically.
 |---|---|---|---|---|
 | Alarm persistence N | 1 to 10 windows | Number of consecutive positive windows before an alarm | Trades false alarms against detection delay; N = 2 to 3 keeps us near the 2 s target | Swept in every run |
 | Decision margin m | 0 and up | A window is positive if seizure spikes exceed non-seizure spikes by more than m | A cheap way to make a model more conservative without retraining | Swept in every run |
-| Window length | 0.5 / 1 / 2 s | Length of each window; the step stays at half a window | 0.5 s holds only about 1.5 cycles of a 3 Hz seizure rhythm; 2 s adds context but delays decisions | `--window`; not scripted |
+| Window length | 0.5 / 1 / 2 s | Length of each window; the step stays at half a window | 0.5 s holds only about 1.5 cycles of a 3 Hz seizure rhythm; 2 s adds context but delays decisions | In `ablate.py` for Models A and B (`lif_win05`, `lif_win2`, `alif_win05`, `alif_win2`) |
 | Channel subsets | 23 / 22 / 21 channels, or other combinations | Which EEG channels feed the model | Two of the 23 are redundant; fewer channels mean fewer input lines and less hardware | Needs a preprocessed cache per channel set |
 | Hybrid encoding | delta only vs delta + rate-coded | Adds rate-coded spikes (spike probability from signal amplitude) alongside the delta spikes | Prior work found the hybrid much better than either encoding alone | Needs a new encoder in the pipeline |
 | Delta threshold alpha | 0.2 / 0.3 / 0.5 | How big a signal change triggers an input spike | Input spike density sets most of the hardware cost; higher alpha means fewer spikes | Needs a preprocessed cache per value |
@@ -66,6 +71,7 @@ is to ignore persistent artifacts that keep a neuron firing.
 | Adaptation time constant | `adapt_shift` = 6 / 7 / 8 (about 0.5 / 1 / 2 s) | How long the raised threshold lasts | Should match how long artifacts persist compared with seizure activity | `--set`; in `ablate.py` |
 | Hidden size | 32 / 64 / 128 / 192 | Number of hidden neurons | Same sizes as Model A, so A and B are compared at matched size. ALIF costs more per neuron (an extra adaptation register), so this shows whether that cost pays off | `--hidden`; in `ablate.py` |
 | int8 cost | float vs int8 | Same as Model A | Same as Model A | `--float-only`; in `ablate.py` |
+| Leak shift k | 4 / 5 / 6 | Same as Model A | k = 4 helped Models A and C in the screen; checks whether it helps B too | `alif_leak4`, `alif_leak6` in `ablate.py` |
 
 ## Model C: SCNN
 
@@ -88,7 +94,7 @@ shift k = 5. All runs below are in `ablate.py`.
 | float_spiking | Same spiking network, trained in float, no int8 | How much accuracy int8 costs |
 | float_relu | Spikes replaced by ReLU activations; software only | How much accuracy spiking costs, with the architecture held fixed. Cleaner than comparing to the 1D-CNN, which also differs in architecture |
 
-Nice-to-have (`ablate.py --nice`):
+Width and sharing (`nice` group, now in the default screen):
 
 | Name | What changes | Why |
 |---|---|---|
@@ -99,6 +105,25 @@ Nice-to-have (`ablate.py --nice`):
 
 The three results that matter most for the report are k1 (is the convolution worth it?), fc (is
 the spatial stage worth it?) and float_relu (what does spiking cost?).
+
+## Model C with ALIF neurons (`scnn_alif`)
+
+Default: Model C's architecture unchanged (656 weights, 46-frame history), but the temporal and
+spatial layers use Model B's ALIF neuron (`adapt_inc` = 16, `adapt_shift` = 7, time constant about
+1 s). The output layer stays plain LIF. Hardware cost: Model C plus 200 int16 adaptation registers.
+Module `scnn_alif.py`; in `ablate.py` as the `scnn_alif` group. It gets Model C's ablations (each
+compared with the Model C run of the same name, so the only difference is the neuron) plus Model B's
+adaptation knobs. `float_relu` has no ALIF twin (ReLUs have no threshold to adapt).
+
+| Name | What changes | Compare against |
+|---|---|---|
+| scnn_alif | Hidden neurons LIF -> ALIF: does adaptation help the convolutional model the way it was meant to help Model B (ignoring persistent artifacts)? | `baseline` |
+| scnn_alif_k1 / _d1 / _d124 / _k32 | Model C's filter-length and dilation ablations | `k1` / `d1` / `d124` / `k32` |
+| scnn_alif_fc | Fully connected readout | `fc` |
+| scnn_alif_float | Float only, no int8 | `float_spiking` |
+| scnn_alif_leak4 / _leak6 | Leak k = 4 / 6 | `leak4` / `leak6` |
+| scnn_alif_inc8 / _inc32 | Adaptation strength `adapt_inc` 8 / 32 | `scnn_alif` (Model B's `alif_inc8` / `alif_inc32`) |
+| scnn_alif_ashift6 / _ashift8 | Adaptation time constant about 0.5 / 2 s | `scnn_alif` (Model B's `alif_ashift6` / `alif_ashift8`) |
 
 ## Cross-model analysis
 

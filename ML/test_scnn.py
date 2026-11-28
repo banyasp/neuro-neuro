@@ -7,7 +7,7 @@ Tests for Model C (scnn.py). Run from ML/:  python test_scnn.py   (or pytest tes
 4. Export round-trip: weights written to .mem, read back by the standalone reference, give the
    same output counts as the PyTorch model.
 Each test runs on the default config and on the ablation variants (fc readout, unshared filters,
-K = 1, three dilation groups), so a --set override can't silently break the hardware math.
+K = 1, three dilation groups, ALIF neurons), so a --set override can't silently break the hardware math.
 """
 
 import copy
@@ -31,6 +31,9 @@ VARIANTS = {
     "unshared": {"share_filters": False},
     "K = 1": {"kernel_len": 1},
     "d = 1, 2, 4": {"dilations": [1, 2, 4], "group_filters": [4, 4, 4]},
+    "ALIF": {"neuron": "alif"},                                   # scnn_alif.py
+    "ALIF, fc readout": {"neuron": "alif", "readout": "fc"},
+    "ALIF, strong adaptation": {"neuron": "alif", "adapt_inc": 48, "adapt_shift": 5},
 }
 
 

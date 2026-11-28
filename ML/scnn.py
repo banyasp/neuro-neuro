@@ -25,6 +25,11 @@ for all channels of a filter group at once): leak v -= v >> k, integrate in incr
 order with int16 saturation after every add, fire at v >= theta, reset by subtracting theta. Each layer uses the previous layer's spikes from the same timestep. Every
 layer passes binary spikes, so the hardware never multiplies.
 
+With neuron = "alif" (module scnn_alif.py), the hidden layers (layer 1, and layer 2 if depthwise)
+use Model B's ALIF neuron instead (alif.alif_step_int; conv_alif_step_int for layer 1): an
+adaptation a per neuron that leaks as a -= a >> k_a, raises the threshold to theta + a and grows by
+adapt_inc per spike. The output layer stays plain LIF, as in alif.py.
+
 This file has three parts, like lif.py:
   1. CONFIG: the shared input spec (common.py) plus this model's constants.
   2. Integer reference (NumPy only): bit-exact model of the hardware math.
@@ -34,6 +39,7 @@ This file has three parts, like lif.py:
 import numpy as np
 
 from common import COMMON_CONFIG, N_IN, T, W_MIN, W_MAX, V_MIN, V_MAX, random_spikes, random_int8
+from alif import alif_step_int
 from lif import lif_step_int
 
 # ---------------------------------------------------------------------------
@@ -51,6 +57,9 @@ CONFIG = {
     "n_outputs": 2,           # neuron 0 = non-seizure, neuron 1 = seizure
     "leak_shift": 5,          # k in v = v - (v >> k), same as lif
     "theta": 64,              # firing threshold, same for every layer
+    "neuron": "lif",          # "alif": hidden layers (1, and 2 if depthwise) use alif.py's neuron
+    "adapt_shift": 7,         # ALIF only, as in alif.py: a = a - (a >> k_a), tau ~ 1 s
+    "adapt_inc": 16,          # ALIF only, as in alif.py: a += adapt_inc per spike
 }
 
 
@@ -103,23 +112,42 @@ def tap_inputs(spikes, t, d, K):
     return x.reshape(K, -1, 2).transpose(1, 0, 2).reshape(spikes.shape[1] // 2, 2 * K)
 
 
+def conv_integrate(v, x, W):
+    """Integrate step of a layer-1 filter group, every channel at once: for each input i = 2k + p
+    in ascending order, add W[i] to the channels whose input i spiked, saturating after every add.
+
+    v: int32 [n_ch, n_filters] (updated in place and returned);  x: 0/1 [n_ch, 2K] from tap_inputs
+    W: int8 [2K, n_filters] (shared by every channel) or [n_ch, 2K, n_filters] (one bank per channel)
+    """
+    for i in range(x.shape[1]):
+        on = x[:, i] == 1                                  # channels whose input i spiked
+        if on.any():
+            w = W[i] if W.ndim == 2 else W[on, i]
+            v[on] = np.clip(v[on] + w.astype(np.int32), V_MIN, V_MAX)
+    return v
+
+
 def conv_step_int(v, x, W, k, theta):
     """One timestep of one layer-1 filter group, every channel at once. The same neuron math as
     lif.lif_step_int; each row is one channel, which has its own active inputs.
-
-    v: int32 [n_ch, n_filters];  x: 0/1 [n_ch, 2K] from tap_inputs
-    W: int8 [2K, n_filters] (shared by every channel) or [n_ch, 2K, n_filters] (one bank per channel)
-    Returns (new v, spikes uint8 [n_ch, n_filters]).
-    """
+    Returns (new v, spikes uint8 [n_ch, n_filters])."""
     v = v - (v >> k)                                       # 1. leak
-    for i in range(x.shape[1]):                            # 2. integrate, input 2k + p ascending
-        on = x[:, i] == 1                                  #    channels whose input i spiked
-        if on.any():
-            w = W[i] if W.ndim == 2 else W[on, i]
-            v[on] = np.clip(v[on] + w.astype(np.int32), V_MIN, V_MAX)   # saturate after every add
+    v = conv_integrate(v, x, W)                            # 2. integrate + saturate
     s = (v >= theta).astype(np.uint8)                      # 3. fire
     v = v - s.astype(np.int32) * theta                     # 4. reset by subtraction
     return v, s
+
+
+def conv_alif_step_int(v, a, x, W, k, theta, k_a, inc):
+    """ALIF version of conv_step_int (neuron = "alif"): the same math as alif.alif_step_int.
+    a: int32 [n_ch, n_filters] adaptation. Returns (new v, new a, spikes uint8 [n_ch, n_filters])."""
+    v = v - (v >> k)                                       # 1. leak membrane
+    a = a - (a >> k_a)                                     # 2. leak adaptation
+    v = conv_integrate(v, x, W)                            # 3. integrate + saturate
+    s = (v >= theta + a).astype(np.uint8)                  # 4. fire against the adapted threshold
+    v = v - s.astype(np.int32) * theta                     # 5. reset by the base threshold
+    a = a + s.astype(np.int32) * inc                       # 6. adapt
+    return v, a, s
 
 
 def run_int_reference(spikes, weights, cfg=CONFIG):
@@ -141,30 +169,43 @@ def run_int_reference(spikes, weights, cfg=CONFIG):
 
     n_ch, K, n_out = cfg["n_channels"], cfg["kernel_len"], cfg["n_outputs"]
     k, theta = cfg["leak_shift"], cfg["theta"]
+    k_a, inc = cfg["adapt_shift"], cfg["adapt_inc"]
+    alif = cfg["neuron"] == "alif"       # hidden layers (1, and 2 if depthwise) are ALIF; output stays LIF
+    assert cfg["neuron"] in ("lif", "alif"), cfg["neuron"]
+    # a never exceeds (inc + 1) * 2^k_a - 1, so a and theta + a fit in int16 without saturation
+    assert not alif or theta + ((inc + 1) << k_a) <= V_MAX, "adaptation could overflow int16"
     C = sum(cfg["group_filters"])
     depthwise = cfg["readout"] == "depthwise"
     n2 = C * cfg["depth_mult"] if depthwise else n_out    # layer-2 size
     W1 = weights["l1"]
 
     v1 = np.zeros((n_ch, C), dtype=np.int32)
+    a1 = np.zeros((n_ch, C), dtype=np.int32)
     v2 = np.zeros(n2, dtype=np.int32)
+    a2 = np.zeros(n2, dtype=np.int32)
     v3 = np.zeros(n_out, dtype=np.int32)
     mem1 = np.zeros((T, n_ch * C), dtype=np.int16)
+    adapt1 = np.zeros((T, n_ch * C), dtype=np.int16)
     spk1 = np.zeros((T, n_ch * C), dtype=np.uint8)
     mem2 = np.zeros((T, n2), dtype=np.int16)
+    adapt2 = np.zeros((T, n2), dtype=np.int16)
     spk2 = np.zeros((T, n2), dtype=np.uint8)
     mem3 = np.zeros((T, n_out), dtype=np.int16)
     spk3 = np.zeros((T, n_out), dtype=np.uint8)
 
     for t in range(T):
-        # Layer 1: in each filter group, neuron (ch, f) is an LIF neuron whose 2K inputs are
-        # channel ch's delayed spikes, with weights W1[:, f].
+        # Layer 1: in each filter group, neuron (ch, f) is an LIF (or ALIF) neuron whose 2K inputs
+        # are channel ch's delayed spikes, with weights W1[:, f].
         s1 = np.zeros((n_ch, C), dtype=np.uint8)
         W = W1 if cfg["share_filters"] else W1.reshape(n_ch, 2 * K, C)
-        for d, a, b in filter_groups(cfg):
+        for d, f0, f1 in filter_groups(cfg):
             x = tap_inputs(spikes, t, d, K)
-            v1[:, a:b], s1[:, a:b] = conv_step_int(v1[:, a:b], x, W[..., a:b], k, theta)
-        mem1[t], spk1[t] = v1.reshape(-1), s1.reshape(-1)
+            if alif:
+                v1[:, f0:f1], a1[:, f0:f1], s1[:, f0:f1] = conv_alif_step_int(
+                    v1[:, f0:f1], a1[:, f0:f1], x, W[..., f0:f1], k, theta, k_a, inc)
+            else:
+                v1[:, f0:f1], s1[:, f0:f1] = conv_step_int(v1[:, f0:f1], x, W[..., f0:f1], k, theta)
+        mem1[t], adapt1[t], spk1[t] = v1.reshape(-1), a1.reshape(-1), s1.reshape(-1)
 
         if depthwise:
             # Layer 2: filter f's D units see only filter f's 23 layer-1 neurons, ch ascending
@@ -172,25 +213,33 @@ def run_int_reference(spikes, weights, cfg=CONFIG):
             s2 = np.zeros(n2, dtype=np.uint8)
             for f in range(C):
                 u = slice(f * D, (f + 1) * D)
-                v2[u], s2[u] = lif_step_int(v2[u], s1[:, f], weights["l2"][:, u], k, theta)
-            # Layer 3: fully connected, input f * D + j ascending
+                if alif:
+                    v2[u], a2[u], s2[u] = alif_step_int(v2[u], a2[u], s1[:, f], weights["l2"][:, u],
+                                                        k, theta, k_a, inc)
+                else:
+                    v2[u], s2[u] = lif_step_int(v2[u], s1[:, f], weights["l2"][:, u], k, theta)
+            # Layer 3 (output, always LIF): fully connected, input f * D + j ascending
             v3, s3 = lif_step_int(v3, s2, weights["l3"], k, theta)
-            mem2[t], spk2[t], mem3[t], spk3[t] = v2, s2, v3, s3
+            mem2[t], adapt2[t], spk2[t], mem3[t], spk3[t] = v2, a2, s2, v3, s3
         else:
-            # Readout "fc": layer 2 is the output layer, input ch * C + f ascending
+            # Readout "fc": layer 2 is the output layer (LIF), input ch * C + f ascending
             v2, s2 = lif_step_int(v2, s1.reshape(-1), weights["l2"], k, theta)
             mem2[t], spk3[t] = v2, s2
 
     counts = spk3.sum(axis=0).astype(np.int32)
     r = {"mem_l1": mem1, "spk_l1": spk1, "mem_l2": mem2}
+    if alif:
+        r["adapt_l1"] = adapt1
     if depthwise:
         r.update({"spk_l2": spk2, "mem_l3": mem3})
+        if alif:
+            r["adapt_l2"] = adapt2
     return {**r, "out": spk3, "counts": counts, "decision": int(counts[1] > counts[0])}
 
 
 # Functions copied into the standalone handoff/<model>/reference_<model>.py
-REFERENCE_FUNCS = [filter_groups, weight_shapes, history_depth, tap_inputs, conv_step_int, lif_step_int,
-                   run_int_reference]
+REFERENCE_FUNCS = [filter_groups, weight_shapes, history_depth, tap_inputs, conv_integrate, conv_step_int,
+                   conv_alif_step_int, lif_step_int, alif_step_int, run_int_reference]
 
 
 def hardware_cost(cfg=CONFIG):
@@ -204,8 +253,11 @@ def hardware_cost(cfg=CONFIG):
         membranes, adds = n_ch * C + C * D + n_out, n_ch * C * K + n_ch * C * D + C * D * n_out
     else:
         membranes, adds = n_ch * C + n_out, n_ch * C * K + n_ch * C * n_out
-    return {"weights": int(sum(np.prod(s) for s in shapes.values())), "membranes": membranes,
+    cost = {"weights": int(sum(np.prod(s) for s in shapes.values())), "membranes": membranes,
             "history_frames": history_depth(cfg), "worst_adds_per_step": adds}
+    if cfg["neuron"] == "alif":          # one adaptation register per hidden (non-output) neuron
+        cost["adapt_registers"] = membranes - n_out
+    return cost
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +290,13 @@ def test_cases(rng, cfg=CONFIG):
                   f"for t < {T // 2}, then off. Hits both int16 rails, then leaks. "
                   f"The + rail appears as {V_MAX - cfg['theta']} (32767 minus reset)", w, spikes))
 
-    cases.append(("dense", "random weights, 30% input spikes (heavy load)",
-                  random_weights(rng, cfg), random_spikes(rng, 0.30)))
+    w, spikes = random_weights(rng, cfg), random_spikes(rng, 0.30)
+    if cfg["neuron"] == "alif":
+        r = run_int_reference(spikes, w, cfg)
+        assert r["adapt_l1"].max() > cfg["adapt_inc"], "dense case: layer-1 adaptation never built up"
+    cases.append(("dense", "random weights, 30% input spikes (heavy load"
+                  + ("; adaptation builds up over several spikes)" if cfg["neuron"] == "alif" else ")"),
+                  w, spikes))
 
     # Seizure: the output layer's column 0 all -128 and column 1 all +127, so decision = 1.
     w = random_weights(rng, cfg)
@@ -289,10 +346,12 @@ def spec_md(cfg=CONFIG):
                  if cfg["share_filters"] else
                  f"`[{n_ch * 2 * K}][{C}]`, address `(ch*{2 * K} + 2k + p)*{C} + f` (one bank per channel)")
     l1_row = "W1[2k + p][f]" if cfg["share_filters"] else f"W1[ch*{2 * K} + 2k + p][f]"
+    alif = cfg["neuron"] == "alif"
+    hid = "ALIF" if alif else "LIF"      # hidden-layer neuron; the output layer is always LIF
 
     if depthwise:
-        arch = (f"{cfg['n_inputs']} inputs -> layer 1 temporal ({n_ch} x {C} = {n_ch * C} LIF) -> "
-                f"layer 2 depthwise spatial ({C} x {D} = {C * D} LIF) -> layer 3 output ({n_out} LIF)")
+        arch = (f"{cfg['n_inputs']} inputs -> layer 1 temporal ({n_ch} x {C} = {n_ch * C} {hid}) -> "
+                f"layer 2 depthwise spatial ({C} x {D} = {C * D} {hid}) -> layer 3 output ({n_out} LIF)")
         later = f"""**Layer 2 (depthwise spatial)**, unit `u = f*{D} + j` (filter `f`, unit `j < {D}`): its inputs are
 the {n_ch} layer-1 neurons of filter `f` only. For each `ch` with `s1[ch][f] == 1`, in **increasing `ch`**:
 `v = sat16(v + W2[ch][u])`.
@@ -304,17 +363,38 @@ the {n_ch} layer-1 neurons of filter `f` only. For each `ch` with `s1[ch][f] == 
         trace_rows = f"""| `expected_mem_l2.mem` | T*{C * D} words, int16: address `t*{C * D} + u`, after reset |
 | `expected_spk_l2.mem` | T words of {C * D} bits: bit `u` = layer-2 unit `u` |
 | `expected_mem_l3.mem` | T*{n_out} words, int16: output membranes, after reset |"""
+        if alif:
+            trace_rows += f"\n| `expected_adapt_l2.mem` | T*{C * D} words, int16: layer-2 adaptation `a`, after the increment |"
     else:
-        arch = (f"{cfg['n_inputs']} inputs -> layer 1 temporal ({n_ch} x {C} = {n_ch * C} LIF) -> "
+        arch = (f"{cfg['n_inputs']} inputs -> layer 1 temporal ({n_ch} x {C} = {n_ch * C} {hid}) -> "
                 f"layer 2 output, fully connected ({n_out} LIF)")
         later = f"""**Layer 2 (output, fully connected)**, neuron `o`: inputs are the {n_ch * C} layer-1 neurons,
 index `n = ch*{C} + f`. For each `n` with `s1[n] == 1`, in **increasing `n`**: `v = sat16(v + W2[n][o])`."""
         weight_rows = f"| `weights_l2.mem` | W2 `[{n_ch * C}][{n_out}]`, address `n*{n_out} + o`, `n = ch*{C} + f` |"
         trace_rows = f"| `expected_mem_l2.mem` | T*{n_out} words, int16: output membranes, after reset |"
 
-    return f"""## Model C: spiking convolutional NN (SCNN)
+    if alif:
+        adapt_rows = (f"\n| `K_ADAPT` (adaptation shift) | {cfg['adapt_shift']} | hidden layers only |"
+                      f"\n| `ADAPT_INC` | {cfg['adapt_inc']} | hidden layers only |")
+        neuron_math = f"""**Hidden layers (layer 1{', layer 2' if depthwise else ''}) are ALIF neurons**, exactly Model B's (`alif`):
+each has an adaptation register `a` (int16, starts at 0 every window). Per step: **leak** `v = v - (v >>> K_LEAK)`,
+**adaptation leak** `a = a - (a >>> K_ADAPT)`, **integrate** its active inputs in the order below with
+`v = sat16(v + w)` after **every** add, **fire** `s = (v >= THETA + a)`, **reset** `v = v - THETA` where `s == 1`
+(the base threshold), **adapt** `a = a + ADAPT_INC` where `s == 1`. `a` stays below
+`(ADAPT_INC + 1) * 2^K_ADAPT = {(cfg['adapt_inc'] + 1) << cfg['adapt_shift']}`, so `THETA + a` never overflows.
+**The output layer is plain LIF** (Model A's neuron): the same steps without `a`."""
+        trace_rows += (f"\n| `expected_adapt_l1.mem` | T*{n_ch * C} words, int16: layer-1 adaptation `a`, "
+                       f"address `t*{n_ch * C} + n`, after the increment |")
+        adapt_cost = f" Plus {cost['adapt_registers']} int16 adaptation registers (one per hidden neuron)."
+    else:
+        adapt_rows, adapt_cost = "", ""
+        neuron_math = """Every neuron is Model A's LIF neuron, unchanged: **leak** `v = v - (v >>> K_LEAK)`, **integrate** its active
+inputs in the order below with `v = sat16(v + w)` after **every** add, **fire** `s = (v >= THETA)`,
+**reset** `v = v - THETA` where `s == 1`."""
 
-{arch}. {cost['weights']} int8 weights, {cost['membranes']} int16 membranes.
+    return f"""## Model C: spiking convolutional NN (SCNN){', ALIF hidden neurons' if alif else ''}
+
+{arch}. {cost['weights']} int8 weights, {cost['membranes']} int16 membranes.{adapt_cost}
 
 | Name | Value | Notes |
 |---|---|---|
@@ -324,7 +404,7 @@ index `n = ch*{C} + f`. For each `n` with `s1[n] == 1`, in **increasing `n`**: `
 | `D` | {D if depthwise else '-'} | spatial units per filter (layer 2) |
 | Readout | {cfg['readout']} | |
 | `K_LEAK` (leak shift) | {cfg['leak_shift']} | every layer |
-| `THETA` | {cfg['theta']} | every layer |
+| `THETA` | {cfg['theta']} | every layer |{adapt_rows}
 | Bias | none | |
 
 Filter groups (tap `k` of filter `f` reads the input frame from `k * d_f` steps ago; tap 0 = now):
@@ -341,9 +421,7 @@ Time scale: one timestep = one EEG sample at {cfg['fs']} Hz ({dt_ms:.2f} ms).
 
 ### Math, per timestep
 
-Every neuron is Model A's LIF neuron, unchanged: **leak** `v = v - (v >>> K_LEAK)`, **integrate** its active
-inputs in the order below with `v = sat16(v + w)` after **every** add, **fire** `s = (v >= THETA)`,
-**reset** `v = v - THETA` where `s == 1`. Each layer uses the previous layer's spikes **from the same
+{neuron_math} Each layer uses the previous layer's spikes **from the same
 timestep** (layer 1, then layer 2, then layer 3, within one step).
 
 **Layer 1 (temporal, convolution as delayed synapses)**, neuron `(ch, f)`, filter `f` in a group with
@@ -353,7 +431,7 @@ before DOWN): `v = sat16(v + {l1_row})`.
 
 {later}
 
-- All membranes and the spike history reset to 0 at the start of every window.
+- All membranes{', adaptation registers' if alif else ''} and the spike history reset to 0 at the start of every window.
 - **Decision:** seizure (1) if output neuron 1 spiked **more** times than neuron 0. Tie = 0.
 - Layer-1 neuron `(ch, f)` is index `n = ch*{C} + f` in every trace.
 
@@ -391,6 +469,7 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
+    from alif import ALIFNet
     from lif import LIFNet
 except ImportError:  # the integer reference above works without PyTorch
     torch = None
@@ -424,6 +503,8 @@ if torch is not None:
 
         float_step = LIFNet.float_step      # same neuron as lif.py, float and QAT
         qat_step = LIFNet.qat_step
+        float_alif_step = ALIFNet.float_alif_step   # neuron = "alif": same neuron as alif.py
+        qat_alif_step = ALIFNet.qat_alif_step
         INIT_STD = 0.5                      # as in lif.py (see the note there), at the default K = 16
 
         def __init__(self, cfg=CONFIG):
@@ -438,6 +519,7 @@ if torch is not None:
             self.w = nn.ParameterDict({name: nn.Parameter(torch.randn(shape) * std.get(name, self.INIT_STD))
                                        for name, shape in shapes.items()})
             self.beta = 1.0 - 2.0 ** -cfg["leak_shift"]
+            self.rho = 1.0 - 2.0 ** -cfg["adapt_shift"]   # ALIF adaptation decay (used only if neuron = "alif")
             self.scale = cfg["theta"]
 
         def int_weight(self, w):
@@ -454,16 +536,31 @@ if torch is not None:
                 spikes.append(s)
             return torch.stack(spikes, dim=1)
 
+        def run_alif(self, current, step):
+            """ALIF over all steps (membrane v and adaptation a, both start at 0): -> spikes [B, T, ...]."""
+            v = current.new_zeros(current[:, 0].shape)
+            a = torch.zeros_like(v)
+            spikes = []
+            for t in range(current.shape[1]):
+                v, a, s = step(v, a, current[:, t])
+                spikes.append(s)
+            return torch.stack(spikes, dim=1)
+
         def layers(self, x, qat=False):
             """Every layer's spikes: (s1 [B, T, n_ch, C], s2 [B, T, C*D] or None, out [B, T, n_out])."""
             w = {n: self.int_weight(p) if qat else p for n, p in self.w.items()}
-            step = self.qat_step if qat else self.float_step
-            s1 = self.run_lif(layer1_currents(x, w["l1"], self.cfg), step)
+            step = self.qat_step if qat else self.float_step           # output layer: always LIF
+            if self.cfg["neuron"] == "alif":                           # hidden layers
+                alif_step = self.qat_alif_step if qat else self.float_alif_step
+                hidden = lambda current: self.run_alif(current, alif_step)
+            else:
+                hidden = lambda current: self.run_lif(current, step)
+            s1 = hidden(layer1_currents(x, w["l1"], self.cfg))
             if self.cfg["readout"] == "fc":
                 return s1, None, self.run_lif(s1.flatten(2) @ w["l2"], step)   # input ch*C + f
             D = self.cfg["depth_mult"]
             # depthwise: unit f*D + j sums filter f over channels
-            s2 = self.run_lif((s1.repeat_interleave(D, dim=-1) * w["l2"]).sum(dim=2), step)
+            s2 = hidden((s1.repeat_interleave(D, dim=-1) * w["l2"]).sum(dim=2))
             return s1, s2, self.run_lif(s2 @ w["l3"], step)
 
         def forward(self, x, qat=False):
